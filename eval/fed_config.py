@@ -13,8 +13,8 @@ LISA_MIDDLE_SAMPLE = 2
 # Training params
 LR = 3e-4
 LOCAL_STEPS = 3
-NUM_CLIENTS = 3
-ROUNDS = 3
+NUM_CLIENTS = 5
+ROUNDS = 5
 MODEL = "EleutherAI/pythia-70m"
 
 # Compression
