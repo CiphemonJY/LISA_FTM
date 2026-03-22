@@ -1,725 +1,453 @@
 #!/usr/bin/env python3
 """
-Inference Engine - Optimized Inference with LISA for Large Models
+Inference Engine — Clean checkpoint loading and generation.
 
-This enables running 100T+ parameter models on consumer hardware
-by combining LISA (Layer-Indexed Sequential Activation) with 
-disk offload and quantization.
+This module provides a functional inference pipeline for LISA_FTM checkpoints.
 
-KEY OPTIMIZATIONS:
-──────────────────────────────────────────────────────────────────
-1. LISA Offload: Only keep 5% of layers in RAM
-2. Quantization: INT4 for 4x compression
-3. KV Cache: Cache attention key-value pairs
-4. Batching: Process multiple requests together
-5. Streaming: Stream tokens for faster first response
-
-MEMORY CALCULATION:
-──────────────────────────────────────────────────────────────────
-100T model in FP16: 200 TB
-INT4 quantization: 50 TB (4x savings)
-LISA 5% in RAM: 2.5 TB (20x more savings)
-With 4 machines: 625 GB per machine (feasible!)
-
-IMPLEMENTATION:
+Key fixes vs naive approaches:
+1. NEVER hardcode hidden_size from a template that doesn't match the checkpoint.
+   Extract shape info directly from checkpoint weights.
+2. For checkpoints saved after resize_token_embeddings(), extract vocab_size
+   from the embedding weight shape (e.g. 50277 vs base model 50304 for Pythia).
+3. Use ignore_mismatched_sizes=True so the model can resize embeddings.
+4. Prefer full checkpoint directories (model.safetensors + config.json) when
+   available; fall back to HuggingFace base + .pt state_dict overlay.
 """
 
 import os
 import sys
-import time
-import hashlib
-import json
-import threading
-import queue
-from typing import Dict, List, Optional, Any, Tuple, Callable, Generator
-from dataclasses import dataclass, field
-from datetime import datetime
 import logging
-import math
+from pathlib import Path
+from typing import List, Optional, Dict, Any, Tuple
+from dataclasses import dataclass
 
-os.environ['PYTHONWARNINGS'] = 'ignore::urllib3.warnings.NotOpenSSLWarning'
+import torch
 
-# Try to import torch
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-    torch = None
-    nn = None
-    F = None
-
-# Try to import numpy
-try:
-    import numpy as np
-    HAS_NUMPY = True
-except ImportError:
-    HAS_NUMPY = False
-    np = None
-
-
-# ============================================================================
-# Inference Configuration
-# ============================================================================
+# ────────────────────────────────────────────────────────────────────────────
+# Backward-compatible re-exports (matches old inference/__init__.py)
+# The old LISAInference/KVCache/InferenceConfig were a non-functional simulator.
+# We re-create minimal stubs here for API compatibility.
+# ────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class InferenceConfig:
-    """Configuration for inference engine."""
-    # Model settings
+    """Stub — kept only for backward API compatibility."""
     model_path: str = ""
-    model_name: str = ""
     num_layers: int = 96
     hidden_size: int = 12288
-    num_attention_heads: int = 96
-    vocab_size: int = 32000
-    max_seq_len: int = 4096
-    
-    # LISA settings
-    lisa_ratio: float = 0.05  # 5% of layers in RAM
-    offload_path: str = "/tmp/offload"  # Disk offload path
-    
-    # Quantization settings
-    quantization_bits: int = 4  # 4, 8, or 16
-    use_quantization: bool = True
-    
-    # KV Cache settings
-    use_kv_cache: bool = True
-    kv_cache_size: int = 2048  # Max cached tokens
-    
-    # Batching settings
-    max_batch_size: int = 8
-    
-    # Generation settings
     max_new_tokens: int = 512
     temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 50
-    
-    # Streaming
-    stream: bool = True
-    
-    def get_memory_requirements(self) -> Dict:
-        """Calculate memory requirements."""
-        # Model params (approximate)
-        # Embedding: vocab_size * hidden_size
-        # Each layer: 4 * hidden_size * hidden_size (Q, K, V, O + MLP)
-        embedding_params = self.vocab_size * self.hidden_size
-        layer_params = 4 * self.hidden_size * self.hidden_size * self.num_layers
-        total_params = embedding_params + layer_params
-        
-        # Memory per param
-        bytes_per_param = self.quantization_bits / 8
-        
-        # Total memory
-        total_memory = total_params * bytes_per_param
-        
-        # LISA memory (fraction in RAM)
-        lisa_memory = total_memory * self.lisa_ratio
-        
-        return {
-            "total_params": total_params,
-            "total_memory_gb": total_memory / 1e9,
-            "lisa_memory_gb": lisa_memory / 1e9,
-            "quantization_bits": self.quantization_bits,
-            "compression_ratio": 16 / self.quantization_bits,
-        }
 
-
-# ============================================================================
-# KV Cache
-# ============================================================================
 
 class KVCache:
-    """
-    Key-Value cache for attention layers.
-    
-    Caches computed key-value pairs to avoid recomputation
-    during generation.
-    
-    Memory: num_layers × 2 × batch_size × seq_len × hidden_size
-    """
-    
-    def __init__(self, config: InferenceConfig):
-        self.config = config
-        self.logger = logging.getLogger("kv-cache")
-        
-        # Cache storage
-        self.key_cache: List[Any] = []  # Per layer
-        self.value_cache: List[Any] = []
-        
-        # Cache metadata
+    """Stub — kept only for backward API compatibility."""
+    def __init__(self, config=None):
         self.current_len = 0
-        self.max_len = config.kv_cache_size
-    
-    def update(self, layer_idx: int, keys: Any, values: Any):
-        """
-        Update cache with new key-value pairs.
-        
-        Args:
-            layer_idx: Layer index
-            keys: New keys [batch, new_tokens, hidden]
-            values: New values [batch, new_tokens, hidden]
-        """
-        if not self.config.use_kv_cache:
-            return
-        
-        # Initialize if needed
-        while len(self.key_cache) <= layer_idx:
-            self.key_cache.append(None)
-            self.value_cache.append(None)
-        
-        # Append to cache
-        if self.key_cache[layer_idx] is None:
-            self.key_cache[layer_idx] = keys
-            self.value_cache[layer_idx] = values
-        else:
-            # Concatenate
-            if HAS_TORCH and isinstance(keys, torch.Tensor):
-                self.key_cache[layer_idx] = torch.cat([
-                    self.key_cache[layer_idx], keys
-                ], dim=1)
-                self.value_cache[layer_idx] = torch.cat([
-                    self.value_cache[layer_idx], values
-                ], dim=1)
-            else:
-                self.key_cache[layer_idx] = np.concatenate([
-                    self.key_cache[layer_idx], keys
-                ], axis=1)
-                self.value_cache[layer_idx] = np.concatenate([
-                    self.value_cache[layer_idx], values
-                ], axis=1)
-        
-        # Update length
-        if self.key_cache[layer_idx] is not None:
-            self.current_len = max(self.current_len, self.key_cache[layer_idx].shape[1])
-        
-        # Check cache size
-        if self.current_len > self.max_len:
-            self.logger.warning(f"KV cache overflow: {self.current_len} > {self.max_len}")
-    
-    def get(self, layer_idx: int) -> Tuple[Any, Any]:
-        """Get cached key-value pairs."""
-        if not self.config.use_kv_cache:
-            return None, None
-        
-        if layer_idx >= len(self.key_cache):
-            return None, None
-        
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
-    
     def clear(self):
-        """Clear cache."""
-        self.key_cache = []
-        self.value_cache = []
         self.current_len = 0
-        self.logger.debug("KV cache cleared")
-    
-    def get_memory_usage(self) -> int:
-        """Get cache memory usage in bytes."""
-        total = 0
-        for k, v in zip(self.key_cache, self.value_cache):
-            if k is not None:
-                if HAS_TORCH and isinstance(k, torch.Tensor):
-                    total += k.numel() * k.element_size()
-                    total += v.numel() * v.element_size()
-                elif HAS_NUMPY and isinstance(k, np.ndarray):
-                    total += k.nbytes
-                    total += v.nbytes
-        return total
+    def get_memory_usage(self):
+        return 0
 
-
-# ============================================================================
-# LISA Inference
-# ============================================================================
 
 class LISAInference:
+    """Stub — kept only for backward API compatibility.
+
+    The real inference is done via load_checkpoint() + model.generate().
+    This stub class exists only so that code importing from the old
+    inference.engine module won't break at import time.
     """
-    LISA-optimized inference engine.
-    
-    Key features:
-    1. Layer-by-layer processing (only 5% in RAM)
-    2. Disk offload for remaining layers
-    3. KV cache for fast generation
-    4. Quantization support
-    5. Streaming generation
+    def __init__(self, config=None):
+        self.config = config or InferenceConfig()
+
+    def load_model(self, model_path):
+        log.warning("LISAInference.load_model is a stub; use load_checkpoint() instead")
+
+    def forward(self, input_ids):
+        yield input_ids
+
+    def get_stats(self):
+        return {}
+
+
+__all__ = [
+    # Real implementation
+    "InferenceEngine",
+    "load_checkpoint",
+    "detect_model_type",
+    "run_generation",
+    "generate",
+    "find_latest_checkpoint",
+    "inspect_checkpoint",
+    # Backward compat stubs
+    "LISAInference",
+    "InferenceConfig",
+    "KVCache",
+]
+
+log = logging.getLogger("inference-engine")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Checkpoint detection
+# ────────────────────────────────────────────────────────────────────────────
+
+def find_latest_checkpoint(output_dir: Path) -> Optional[Path]:
+    """Find the latest .pt checkpoint in output dir. Prefers final_model.pt."""
+    checkpoints = list(output_dir.glob("*.pt"))
+    if not checkpoints:
+        return None
+    final = output_dir / "final_model.pt"
+    if final.exists():
+        return final
+    return max(checkpoints, key=lambda p: p.stat().st_mtime)
+
+
+def detect_model_type(checkpoint_dir: Path) -> str:
     """
-    
-    def __init__(self, config: InferenceConfig):
-        self.config = config
-        self.logger = logging.getLogger("lisa-inference")
-        
-        # Model layers
-        self.layers: List[Any] = []
-        self.layer_assignments: Dict[int, str] = {}  # layer_idx -> "ram" or "disk"
-        
-        # KV cache
-        self.kv_cache = KVCache(config)
-        
-        # Offload manager
-        self.offload_path = config.offload_path
-        os.makedirs(self.offload_path, exist_ok=True)
-        
-        # Statistics
-        self.stats = {
-            "total_inferences": 0,
-            "total_tokens": 0,
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "ram_layers_loaded": 0,
-            "disk_layers_loaded": 0,
-        }
-    
-    def load_model(self, model_path: str):
-        """
-        Load model with LISA optimization.
-        
-        Keeps only lisa_ratio layers in RAM, offloads rest to disk.
-        """
-        self.logger.info(f"Loading model from {model_path}")
-        
-        # This would load the actual model
-        # For now, we simulate
-        self.logger.info(f"Model loaded: {self.config.num_layers} layers")
-        
-        # Assign layers to RAM or disk
-        num_ram_layers = int(self.config.num_layers * self.config.lisa_ratio)
-        
-        # Keep important layers in RAM (first, last, and evenly distributed)
-        ram_indices = self._get_ram_layer_indices(num_ram_layers)
-        
-        for i in range(self.config.num_layers):
-            if i in ram_indices:
-                self.layer_assignments[i] = "ram"
-            else:
-                self.layer_assignments[i] = "disk"
-        
-        self.logger.info(
-            f"LISA assignment: {len(ram_indices)} layers in RAM, "
-            f"{self.config.num_layers - len(ram_indices)} on disk"
+    Detect model architecture from checkpoint directory.
+
+    Returns: "pythia" (GPT-NeoX), "tinyllama" (Llama), or "unknown"
+    """
+    config_path = checkpoint_dir / "config.json"
+    if config_path.exists():
+        import json
+        with open(config_path) as f:
+            cfg = json.load(f)
+        model_type = cfg.get("model_type", "")
+        if "gpt2" in model_type.lower() or "gpt-neox" in model_type.lower():
+            return "pythia"
+        elif "llama" in model_type.lower():
+            return "tinyllama"
+        # Check hidden_size as fallback clue
+        n_embd = cfg.get("n_embd", cfg.get("hidden_size", 0))
+        if n_embd == 512:
+            return "pythia"
+        elif n_embd == 2048:
+            return "tinyllama"
+
+    # Inspect checkpoint key format
+    ckpt = find_latest_checkpoint(checkpoint_dir)
+    if ckpt and ckpt.exists():
+        state = torch.load(ckpt, map_location="cpu", weights_only=True)
+        first_key = next(iter(state.keys()), "")
+        del state
+        if "gpt_neox" in first_key:
+            return "pythia"
+        elif "model.embed_tokens" in first_key or ("lm_head" in first_key and "layers" in first_key):
+            return "tinyllama"
+    return "unknown"
+
+
+def inspect_checkpoint(ckpt_path: Path) -> Dict[str, Any]:
+    """Extract shape info from a checkpoint for config building."""
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    info = {"keys": len(state), "layers": 0}
+
+    for k, v in state.items():
+        if not isinstance(v, torch.Tensor):
+            continue
+        if "embed" in k or "lm_head" in k:
+            info["vocab_size"] = v.shape[0]
+            info["hidden_size"] = v.shape[1]
+        parts = k.split(".")
+        if len(parts) >= 3 and parts[0] == "gpt_neox" and parts[2] == "layers":
+            info["layers"] = max(info["layers"], int(parts[1]) + 1)
+        elif len(parts) >= 3 and parts[1] == "layers":
+            # Llama/TinyLlama: model.layers.N.xxx
+            info["layers"] = max(info["layers"], int(parts[2]) + 1)
+
+    del state
+    return info
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Model loading
+# ────────────────────────────────────────────────────────────────────────────
+
+def _load_pythia_checkpoint(
+    checkpoint_dir: Path,
+    checkpoint_name: Optional[str] = None,
+) -> Tuple[Any, Any, Any]:
+    """Load a Pythia-70m + LoRA checkpoint."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+
+    config_path = checkpoint_dir / "config.json"
+    safetensors_path = checkpoint_dir / "model.safetensors"
+    base_model_id = "EleutherAI/pythia-70m"
+
+    has_full = config_path.exists() and safetensors_path.exists()
+
+    if has_full:
+        log.info(f"Full checkpoint layout detected in {checkpoint_dir}")
+        config = AutoConfig.from_pretrained(str(checkpoint_dir), trust_remote_code=True)
+        base_source = str(checkpoint_dir)
+    else:
+        log.info(f"No full layout — loading from HuggingFace: {base_model_id}")
+        base_config = AutoConfig.from_pretrained(base_model_id, trust_remote_code=True)
+
+        # Inspect checkpoint for exact shapes
+        ckpt = checkpoint_dir / (checkpoint_name or "final_model.pt")
+        if not ckpt.exists():
+            ckpt = find_latest_checkpoint(checkpoint_dir)
+        if ckpt:
+            info = inspect_checkpoint(ckpt)
+            log.info(f"  Checkpoint info: {info}")
+            if "vocab_size" in info:
+                log.info(f"  Overriding vocab_size: {base_config.vocab_size} -> {info['vocab_size']}")
+                base_config.vocab_size = info["vocab_size"]
+            if "hidden_size" in info:
+                log.info(f"  Overriding hidden_size: {base_config.hidden_size} -> {info['hidden_size']}")
+                base_config.hidden_size = info["hidden_size"]
+            if info.get("layers"):
+                log.info(f"  Overriding num_hidden_layers: {base_config.num_hidden_layers} -> {info['layers']}")
+                base_config.num_hidden_layers = info["layers"]
+
+        config = base_config
+        base_source = base_model_id
+
+    log.info(f"  Loading config: hidden={config.hidden_size}, vocab={config.vocab_size}, layers={config.num_hidden_layers}")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_source, config=config, trust_remote_code=True,
+        torch_dtype=torch.float32, ignore_mismatched_sizes=True,
+    )
+
+    # Tokenizer
+    if (checkpoint_dir / "tokenizer.json").exists():
+        tokenizer = AutoTokenizer.from_pretrained(str(checkpoint_dir), trust_remote_code=True)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    # Load .pt checkpoint
+    ckpt_path = checkpoint_dir / checkpoint_name if checkpoint_name else find_latest_checkpoint(checkpoint_dir)
+    if ckpt_path and ckpt_path.exists():
+        log.info(f"Loading state dict: {ckpt_path}")
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        log.info(f"  Keys: {len(state)}")
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            log.warning(f"  Missing: {missing[:3]}...")
+        if unexpected:
+            log.warning(f"  Unexpected (LoRA/normal): {unexpected[:3]}...")
+        del state
+
+    return model, tokenizer, config
+
+
+def _load_tinyllama_checkpoint(
+    checkpoint_dir: Path,
+    checkpoint_name: Optional[str] = None,
+) -> Tuple[Any, Any, Any]:
+    """Load a TinyLlama + LoRA checkpoint."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+
+    config_path = checkpoint_dir / "config.json"
+    safetensors_path = checkpoint_dir / "model.safetensors"
+    base_model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+    has_full = config_path.exists() and safetensors_path.exists()
+
+    if has_full:
+        log.info(f"Full checkpoint layout detected in {checkpoint_dir}")
+        config = AutoConfig.from_pretrained(str(checkpoint_dir), trust_remote_code=True)
+        base_source = str(checkpoint_dir)
+    else:
+        log.info(f"No full layout — loading from HuggingFace: {base_model_id}")
+        base_config = AutoConfig.from_pretrained(base_model_id, trust_remote_code=True)
+
+        ckpt = checkpoint_dir / (checkpoint_name or "final_model.pt")
+        if not ckpt.exists():
+            ckpt = find_latest_checkpoint(checkpoint_dir)
+        if ckpt:
+            info = inspect_checkpoint(ckpt)
+            log.info(f"  Checkpoint info: {info}")
+            if "vocab_size" in info:
+                base_config.vocab_size = info["vocab_size"]
+            if "hidden_size" in info:
+                base_config.hidden_size = info["hidden_size"]
+            if info.get("layers"):
+                base_config.num_hidden_layers = info["layers"]
+
+        config = base_config
+        base_source = base_model_id
+
+    log.info(f"  Loading config: hidden={config.hidden_size}, vocab={config.vocab_size}, layers={config.num_hidden_layers}")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_source, config=config, trust_remote_code=True,
+        torch_dtype=torch.float32, ignore_mismatched_sizes=True,
+    )
+
+    if (checkpoint_dir / "tokenizer.json").exists():
+        tokenizer = AutoTokenizer.from_pretrained(str(checkpoint_dir), trust_remote_code=True)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    ckpt_path = checkpoint_dir / checkpoint_name if checkpoint_name else find_latest_checkpoint(checkpoint_dir)
+    if ckpt_path and ckpt_path.exists():
+        log.info(f"Loading state dict: {ckpt_path}")
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            log.warning(f"  Missing: {missing[:3]}...")
+        if unexpected:
+            log.warning(f"  Unexpected: {unexpected[:3]}...")
+        del state
+
+    return model, tokenizer, config
+
+
+def load_checkpoint(
+    checkpoint_dir: Path,
+    checkpoint_name: Optional[str] = None,
+    model_type: Optional[str] = None,
+) -> Tuple[Any, Any, Any]:
+    """
+    Load a model + tokenizer from a checkpoint directory.
+
+    Auto-detects model type (Pythia or TinyLlama) and handles both full
+    checkpoint layouts (safetensors + config) and training-output layouts
+    (just .pt files).
+    """
+    if model_type is None:
+        model_type = detect_model_type(checkpoint_dir)
+
+    log.info(f"Detected model type: {model_type}")
+
+    if model_type == "pythia":
+        return _load_pythia_checkpoint(checkpoint_dir, checkpoint_name)
+    elif model_type == "tinyllama":
+        return _load_tinyllama_checkpoint(checkpoint_dir, checkpoint_name)
+    else:
+        # Try Pythia first, then TinyLlama
+        try:
+            return _load_pythia_checkpoint(checkpoint_dir, checkpoint_name)
+        except Exception as e:
+            log.warning(f"Pythia load failed ({e}), trying TinyLlama...")
+            return _load_tinyllama_checkpoint(checkpoint_dir, checkpoint_name)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Generation
+# ────────────────────────────────────────────────────────────────────────────
+
+def generate(
+    model,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int = 30,
+    temperature: float = 0.8,
+    top_p: float = 0.9,
+    repetition_penalty: float = 1.1,
+) -> str:
+    """
+    Generate text from a single prompt.
+
+    Returns the decoded string (prompt + generated tokens).
+    """
+    model.eval()
+    inputs = tokenizer(prompt, return_tensors="pt", return_attention_mask=False)
+    inputs = {k: v.clamp(0, tokenizer.vocab_size - 1) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=tokenizer.eos_token_id,
+            repetition_penalty=repetition_penalty,
         )
-    
-    def _get_ram_layer_indices(self, num_ram: int) -> List[int]:
-        """
-        Get indices of layers to keep in RAM.
-        
-        Strategy: Keep first, last, and evenly distributed middle layers.
-        """
-        indices = []
-        
-        # Always keep first (embedding) and last (output)
-        indices.append(0)
-        indices.append(self.config.num_layers - 1)
-        
-        # Distribute remaining across model
-        remaining = num_ram - 2
-        if remaining > 0:
-            step = (self.config.num_layers - 2) / (remaining + 1)
-            for i in range(1, remaining + 1):
-                idx = int(i * step)
-                if idx not in indices:
-                    indices.append(idx)
-        
-        return sorted(indices)
-    
-    def get_layer(self, layer_idx: int) -> Any:
-        """
-        Get a layer, loading from disk if necessary.
-        
-        LISA optimization: RAM layers are instant,
-        disk layers need to be loaded.
-        """
-        if self.layer_assignments.get(layer_idx) == "ram":
-            self.stats["ram_layers_loaded"] += 1
-            # Layer is in RAM
-            return self.layers[layer_idx]
-        else:
-            self.stats["disk_layers_loaded"] += 1
-            # Load from disk
-            return self._load_layer_from_disk(layer_idx)
-    
-    def _load_layer_from_disk(self, layer_idx: int) -> Any:
-        """Load layer from disk."""
-        path = os.path.join(self.offload_path, f"layer_{layer_idx}.pt")
-        
-        if os.path.exists(path):
-            if HAS_TORCH:
-                layer = torch.load(path)
-                self.logger.debug(f"Loaded layer {layer_idx} from disk")
-                return layer
-            else:
-                with open(path, 'r') as f:
-                    return json.load(f)
-        else:
-            self.logger.warning(f"Layer {layer_idx} not found on disk")
-            return None
-    
-    def forward_layer(self, layer_idx: int, hidden_states: Any, 
-                      attention_mask: Any = None) -> Any:
-        """
-        Forward pass through a single layer.
-        
-        With LISA: Load layer from disk, process, return result.
-        """
-        # Get layer
-        layer = self.get_layer(layer_idx)
-        
-        # This would call the actual layer forward
-        # For simulation, we just pass through
-        self.logger.debug(f"Forward layer {layer_idx}")
-        
-        return hidden_states
-    
-    def forward(self, input_ids: Any) -> Generator[Any, None, None]:
-        """
-        Forward pass with streaming generation.
-        
-        Yields tokens as they're generated.
-        """
-        self.logger.info(f"Starting generation, max tokens: {self.config.max_new_tokens}")
-        
-        # Initialize
-        self.kv_cache.clear()
-        hidden_states = input_ids
-        
-        # Generate tokens
-        for token_idx in range(self.config.max_new_tokens):
-            # Forward through all layers
-            for layer_idx in range(self.config.num_layers):
-                hidden_states = self.forward_layer(layer_idx, hidden_states)
-            
-            # Get next token
-            next_token = self._sample_token(hidden_states)
-            
-            # Yield token
-            yield next_token
-            
-            # Update for next iteration
-            hidden_states = next_token
-            
-            self.stats["total_tokens"] += 1
-        
-        self.stats["total_inferences"] += 1
-    
-    def _sample_token(self, logits: Any) -> Any:
-        """
-        Sample next token from logits.
-        
-        Supports temperature, top_p, top_k sampling.
-        """
-        # This would implement actual sampling
-        # For simulation, return random token
-        self.logger.debug("Sampling token")
-        
-        if HAS_TORCH and isinstance(logits, torch.Tensor):
-            # Apply temperature
-            if self.config.temperature != 1.0:
-                logits = logits / self.config.temperature
-            
-            # Apply top_k
-            if self.config.top_k > 0:
-                indices_to_remove = logits < torch.topk(logits, self.config.top_k)[0][..., -1, None]
-                logits[indices_to_remove] = float('-inf')
-            
-            # Apply top_p
-            if self.config.top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > self.config.top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                logits[indices_to_remove] = float('-inf')
-            
-            # Sample
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            
-            return next_token
-        else:
-            # Fallback
-            return 0
-    
-    def get_stats(self) -> Dict:
-        """Get inference statistics."""
-        stats = self.stats.copy()
-        stats["kv_cache_size"] = self.kv_cache.get_memory_usage()
-        stats["kv_cache_len"] = self.kv_cache.current_len
-        return stats
+
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 
-# ============================================================================
-# Batched Inference
-# ============================================================================
-
-class BatchedInference:
+def run_generation(
+    checkpoint_dir: Path,
+    prompts: List[str],
+    checkpoint_name: Optional[str] = None,
+    max_new_tokens: int = 30,
+    temperature: float = 0.8,
+    model_type: Optional[str] = None,
+) -> List[Dict[str, str]]:
     """
-    Batched inference for efficiency.
-    
-    Processes multiple requests together for better GPU utilization.
+    Load a checkpoint and run generation on a list of prompts.
+
+    Returns a list of dicts: [{"prompt": ..., "output": ...}, ...]
     """
-    
-    def __init__(self, config: InferenceConfig):
-        self.config = config
-        self.logger = logging.getLogger("batched-inference")
-        
-        self.inference = LISAInference(config)
-        
-        # Request queue
-        self.request_queue: queue.Queue = queue.Queue()
-        self.response_queues: Dict[str, queue.Queue] = {}
-    
-    def submit(self, request_id: str, input_ids: Any) -> queue.Queue:
-        """
-        Submit a request for inference.
-        
-        Returns a queue that will receive generated tokens.
-        """
-        # Create response queue
-        self.response_queues[request_id] = queue.Queue()
-        
-        # Add to request queue
-        self.request_queue.put((request_id, input_ids))
-        
-        self.logger.debug(f"Request {request_id} submitted")
-        
-        return self.response_queues[request_id]
-    
-    def process_batch(self):
-        """Process a batch of requests."""
-        batch = []
-        request_ids = []
-        
-        # Collect batch
-        while len(batch) < self.config.max_batch_size:
-            try:
-                request_id, input_ids = self.request_queue.get_nowait()
-                batch.append(input_ids)
-                request_ids.append(request_id)
-            except queue.Empty:
-                break
-        
-        if not batch:
-            return
-        
-        self.logger.debug(f"Processing batch of {len(batch)} requests")
-        
-        # Forward pass
-        # (In real implementation, would batch inputs)
-        
-        # Send responses
-        for request_id in request_ids:
-            self.response_queues[request_id].put("done")
+    model, tokenizer, config = load_checkpoint(checkpoint_dir, checkpoint_name, model_type)
+
+    n_params = sum(p.numel() for p in model.parameters())
+    log.info(f"Model ready: {n_params:,} params")
+
+    results = []
+    for prompt in prompts:
+        text = generate(model, tokenizer, prompt, max_new_tokens, temperature)
+        # Sanitize for Windows console
+        safe = text.encode("cp1252", errors="replace").decode("cp1252")
+        log.info(f"  [{prompt[:40]}] -> [{safe[:60]}]")
+        results.append({"prompt": prompt, "output": safe})
+
+    return results
 
 
-# ============================================================================
-# Streaming Inference Server
-# ============================================================================
+# ────────────────────────────────────────────────────────────────────────────
+# CLI entry point
+# ────────────────────────────────────────────────────────────────────────────
 
-class InferenceServer:
-    """
-    Server for streaming inference.
-    
-    Provides API for:
-    - Streaming generation
-    - Batched inference
-    - Model management
-    """
-    
-    def __init__(self, config: InferenceConfig):
-        self.config = config
-        self.logger = logging.getLogger("inference-server")
-        
-        self.inference = LISAInference(config)
-        self.batched = BatchedInference(config)
-        
-        # Statistics
-        self.server_stats = {
-            "requests_served": 0,
-            "tokens_generated": 0,
-            "avg_latency": 0,
-            "queue_size": 0,
-        }
-    
-    def generate(self, prompt: str, max_tokens: int = None) -> Generator[str, None, None]:
-        """
-        Generate text from prompt.
-        
-        Yields tokens as they're generated.
-        """
-        if max_tokens is None:
-            max_tokens = self.config.max_new_tokens
-        
-        self.logger.info(f"Generating up to {max_tokens} tokens")
-        
-        # Tokenize
-        # (In real implementation, would use tokenizer)
-        input_ids = prompt
-        
-        # Generate
-        start_time = time.time()
-        token_count = 0
-        
-        for token in self.inference.forward(input_ids):
-            token_count += 1
-            
-            # Yield token
-            yield str(token)
-            
-            if token_count >= max_tokens:
-                break
-        
-        # Update stats
-        latency = time.time() - start_time
-        self.server_stats["requests_served"] += 1
-        self.server_stats["tokens_generated"] += token_count
-        self.server_stats["avg_latency"] = (
-            (self.server_stats["avg_latency"] * (self.server_stats["requests_served"] - 1) + latency)
-            / self.server_stats["requests_served"]
-        )
-    
-    def get_stats(self) -> Dict:
-        """Get server statistics."""
-        stats = self.server_stats.copy()
-        stats["inference_stats"] = self.inference.get_stats()
-        stats["config"] = {
-            "num_layers": self.config.num_layers,
-            "hidden_size": self.config.hidden_size,
-            "lisa_ratio": self.config.lisa_ratio,
-            "quantization_bits": self.config.quantization_bits,
-        }
-        return stats
+def main():
+    import argparse
 
+    parser = argparse.ArgumentParser(description="LISA_FTM Inference Engine")
+    parser.add_argument("--dir", type=str, default="output/real_training",
+                        help="Checkpoint directory")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Specific checkpoint .pt file name within the directory")
+    parser.add_argument("--prompts", type=str, nargs="+",
+                        default=["PyTorch is a", "Machine learning models",
+                                "The history of artificial"],
+                        help="Generation prompts")
+    parser.add_argument("--max_tokens", type=int, default=30)
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--model_type", type=str, default=None,
+                        choices=["pythia", "tinyllama", None],
+                        help="Force model type (auto-detected if not set)")
 
-# ============================================================================
-# Demo
-# ============================================================================
+    args = parser.parse_args()
 
-def test_inference_engine():
-    """Test inference engine."""
-    print("="*70)
-    print("INFERENCE ENGINE TEST")
-    print("="*70)
-    print()
-    
-    # Check dependencies
-    print("DEPENDENCIES:")
-    print(f"  NumPy: {'✓' if HAS_NUMPY else '✗'}")
-    print(f"  PyTorch: {'✓' if HAS_TORCH else '✗'}")
-    print()
-    
-    # Test configuration
-    print("="*70)
-    print("1. CONFIGURATION")
-    print("="*70)
-    print()
-    
-    # Test different model sizes
-    configs = [
-        ("Llama-7B", InferenceConfig(
-            num_layers=32, hidden_size=4096, quantization_bits=4
-        )),
-        ("Llama-70B", InferenceConfig(
-            num_layers=80, hidden_size=8192, quantization_bits=4
-        )),
-        ("Hypothetical-100T", InferenceConfig(
-            num_layers=200, hidden_size=16384, quantization_bits=4, lisa_ratio=0.05
-        )),
-    ]
-    
-    for name, config in configs:
-        reqs = config.get_memory_requirements()
-        print(f"\n{name}:")
-        print(f"  Parameters: {reqs['total_params']:.2e}")
-        print(f"  Total memory: {reqs['total_memory_gb']:.1f} GB")
-        print(f"  LISA memory (5%): {reqs['lisa_memory_gb']:.1f} GB")
-        print(f"  Quantization: {reqs['quantization_bits']}-bit")
-    
-    print()
-    
-    # Test KV cache
-    print("="*70)
-    print("2. KV CACHE")
-    print("="*70)
-    print()
-    
-    config = InferenceConfig()
-    kv_cache = KVCache(config)
-    
-    print(f"Max cache size: {config.kv_cache_size} tokens")
-    print(f"Cache enabled: {config.use_kv_cache}")
-    print()
-    
-    # Test LISA layer assignment
-    print("="*70)
-    print("3. LISA LAYER ASSIGNMENT")
-    print("="*70)
-    print()
-    
-    inference = LISAInference(InferenceConfig(num_layers=96, lisa_ratio=0.05))
-    ram_indices = inference._get_ram_layer_indices(int(96 * 0.05))
-    
-    print(f"Total layers: 96")
-    print(f"RAM layers: {len(ram_indices)} ({len(ram_indices)/96*100:.1f}%)")
-    print(f"Disk layers: {96 - len(ram_indices)} ({(96-len(ram_indices))/96*100:.1f}%)")
-    print()
-    print(f"RAM layer indices: {ram_indices}")
-    print()
-    
-    # Test memory calculation
-    print("="*70)
-    print("4. 100T MODEL MEMORY BREAKDOWN")
-    print("="*70)
-    print()
-    
-    print("Without optimizations:")
-    print("  FP16 (16-bit): 200 TB total")
-    print("  All layers in RAM: 200 TB")
-    print("  NOT FEASIBLE on consumer hardware!")
-    print()
-    
-    print("With INT4 quantization:")
-    print("  INT4: 50 TB total (4x savings)")
-    print("  All layers in RAM: 50 TB")
-    print("  Still NOT feasible on consumer hardware")
-    print()
-    
-    print("With INT4 + LISA (5%):")
-    print("  INT4: 50 TB total")
-    print("  LISA: 50 TB × 5% = 2.5 TB in RAM")
-    print("  Disk offload: 47.5 TB on fast SSD")
-    print("  STILL too much for single machine!")
-    print()
-    
-    print("With INT4 + LISA (5%) + 4 machines:")
-    print("  Per machine: 50 TB / 4 = 12.5 TB")
-    print("  LISA RAM: 12.5 TB × 5% = 625 GB")
-    print("  Disk offload: 11.875 TB on fast SSD")
-    print()
-    print("  With Mac Studio (64GB RAM + fast SSD):")
-    print("    - 625 GB in RAM: Need swap/page file")
-    print("    - 11.875 TB on SSD: ~3 × 4TB SSDs (~$600)")
-    print("    - FEASIBLE with model parallelism!")
-    print()
-    
-    # Test inference stats
-    print("="*70)
-    print("5. INFERENCE STATISTICS")
-    print("="*70)
-    print()
-    
-    server = InferenceServer(config)
-    stats = server.get_stats()
-    
-    print("Server stats:")
-    print(f"  Requests served: {stats['requests_served']}")
-    print(f"  Tokens generated: {stats['tokens_generated']}")
-    print(f"  Avg latency: {stats['avg_latency']:.3f}s")
-    print()
-    
-    print("✓ Inference engine working!")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    root = Path(__file__).parent.parent
+    ckpt_dir = root / args.dir
+
+    if not ckpt_dir.exists():
+        log.error(f"Checkpoint directory not found: {ckpt_dir}")
+        return
+
+    log.info(f"Loading checkpoint from: {ckpt_dir}")
+    results = run_generation(
+        ckpt_dir,
+        args.prompts,
+        checkpoint_name=args.checkpoint,
+        max_new_tokens=args.max_tokens,
+        temperature=args.temperature,
+        model_type=args.model_type,
+    )
+
+    log.info("\n" + "=" * 60)
+    log.info("GENERATION RESULTS")
+    log.info("=" * 60)
+    for r in results:
+        log.info(f"  Prompt: {r['prompt']}")
+        log.info(f"  Output: {r['output']}\n")
 
 
 if __name__ == "__main__":
-    test_inference_engine()
+    main()
