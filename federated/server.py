@@ -34,6 +34,8 @@ import copy
 import numpy as np
 import torch
 
+from federated.privacy import GradientPrivacy, DPConfig
+
 # Optional FastAPI
 try:
     from fastapi import FastAPI, HTTPException, Request
@@ -127,16 +129,16 @@ class ServerMetrics:
 
 class GradientValidator:
     """Validate incoming gradient updates."""
-    
+
     def __init__(self, config: Dict):
         self.config = config
         self.noise_threshold = config.get("gradient_noise_tolerance", 1e6)
         self.history: Dict[str, List[float]] = defaultdict(list)
-    
+
     def validate(self, client_id: str, update: Dict) -> Tuple[bool, str]:
         """
         Validate a gradient update.
-        
+
         Returns: (is_valid, reason)
         """
         # Check required fields
@@ -144,27 +146,27 @@ class GradientValidator:
         for field in required:
             if field not in update:
                 return False, f"Missing required field: {field}"
-        
+
         # Check gradient norm is reasonable
         norm = update.get("gradient_norm", 0)
         if norm > self.noise_threshold:
             return False, f"Gradient norm {norm:.2e} exceeds threshold"
-        
+
         if norm < 1e-10:
             return False, "Gradient norm too small (likely no training)"
-        
+
         # Check num_samples
         num_samples = update.get("num_samples", 0)
         if num_samples <= 0:
             return False, "num_samples must be positive"
-        
+
         # Check loss is improving (loss_after < loss_before)
         if "loss_before" in update and "loss_after" in update:
             if update["loss_after"] > update["loss_before"] + 1.0:
                 return False, "Loss increased (possible gradient issue)"
-        
+
         return True, "Valid"
-    
+
     def record_norm(self, client_id: str, norm: float):
         """Record gradient norm for history."""
         self.history[client_id].append(norm)
@@ -178,33 +180,22 @@ class GradientValidator:
 
 class GradientAggregator:
     """Aggregate gradient updates from multiple clients."""
-    
-    def __init__(self, method: str = "fedavg"):
+
+    def __init__(self, method: str = "fedavg", gradient_privacy: Optional[GradientPrivacy] = None,
+                 dp_enabled: bool = False, dp_config: Optional[DPConfig] = None):
         self.method = method
         self.compressor = None  # Server-side compression if needed
-    
-    def aggregate(
-        self,
-        updates: List[Dict],
-        reputations: Dict[str, float],
-    ) -> Tuple[Optional[bytes], Dict]:
-        """
-        Aggregate gradients using FedAvg.
-        
-        Updates may have:
-          - gradient_data as bytes (HTTP path, compressed)
-          - gradient_data as dict (socket path, raw torch tensors)
-        
-        Returns: (aggregated_state_dict_bytes, stats)
-        """
-        if not updates:
-            return None, {"status": "no_updates"}
-        
+        self.gradient_privacy = gradient_privacy
+        self.dp_enabled = dp_enabled
+        self.dp_config = dp_config or DPConfig(enabled=False)
+
+    def _decompress_updates(self, updates: List[Dict]) -> List[Tuple[str, int, Dict]]:
+        """Decompress raw update dicts into (client_id, num_samples, state_dict) tuples."""
         decompressed = []
         for u in updates:
             try:
                 data = u.get("gradient_data", b"")
-                
+
                 if isinstance(data, dict):
                     # Socket path: gradient_data is already a dict of tensors
                     state_dict = {}
@@ -230,13 +221,78 @@ class GradientAggregator:
             except Exception as e:
                 logger.warning(f"Failed to decompress gradient from {u.get('client_id')}: {e}")
                 continue
-        
+        return decompressed
+
+    def dp_aggregate(
+        self,
+        updates: List[Dict],
+        reputations: Dict[str, float],
+    ) -> Tuple[Optional[bytes], Dict]:
+        """
+        Aggregate gradients with differential privacy (Gaussian mechanism).
+
+        Clip each client's gradient → weighted sum → add Gaussian noise.
+        Returns private aggregated gradient bytes.
+        """
+        decompressed = self._decompress_updates(updates)
         if not decompressed:
             return None, {"status": "no_valid_gradients"}
-        
+
+        # Extract gradient dicts and weights
+        grad_dicts = [state_dict for _, _, state_dict in decompressed]
+        client_weights = []
+        for client_id, num_samples, _ in decompressed:
+            rep = reputations.get(client_id, 50.0) / 50.0
+            client_weights.append(num_samples * rep)
+
+        # DP aggregation: clip → sum → add noise
+        private_grad = self.gradient_privacy.dp_aggregate(
+            grad_dicts,
+            noise_multiplier=self.dp_config.noise_multiplier,
+            max_grad_norm=self.dp_config.max_grad_norm,
+            client_weights=client_weights,
+        )
+
+        serialized = pickle.dumps(private_grad)
+        stats = {
+            "status": "success",
+            "method": "dp_fedavg",
+            "num_updates": len(decompressed),
+            "total_samples": sum(w for w in client_weights),
+            "aggregated_size": len(serialized),
+            "dp_enabled": True,
+        }
+        return serialized, stats
+
+    def aggregate(
+        self,
+        updates: List[Dict],
+        reputations: Dict[str, float],
+    ) -> Tuple[Optional[bytes], Dict]:
+        """
+        Aggregate gradients using FedAvg (or DP-FedAvg if enabled).
+
+        Updates may have:
+          - gradient_data as bytes (HTTP path, compressed)
+          - gradient_data as dict (socket path, raw torch tensors)
+
+        Returns: (aggregated_state_dict_bytes, stats)
+        """
+        if not updates:
+            return None, {"status": "no_updates"}
+
+        # DP path: use DP aggregation instead of plain FedAvg
+        if self.dp_enabled and self.gradient_privacy is not None:
+            return self.dp_aggregate(updates, reputations)
+
+        decompressed = self._decompress_updates(updates)
+
+        if not decompressed:
+            return None, {"status": "no_valid_gradients"}
+
         # FedAvg: weighted average by sample count, reputation-normalized
         total_samples = sum(s for _, s, _ in decompressed)
-        
+
         # Initialize aggregated with zero tensors
         first_state = decompressed[0][2]
         aggregated = {}
@@ -245,18 +301,18 @@ class GradientAggregator:
                 aggregated[key] = np.zeros_like(val, dtype=np.float32)
             elif isinstance(val, torch.Tensor):
                 aggregated[key] = torch.zeros_like(val, dtype=torch.float32)
-        
+
         # Compute total weight (sample count * reputation factor)
         total_weight = 0.0
         for client_id, num_samples, _ in decompressed:
             rep = reputations.get(client_id, 50.0) / 50.0  # Normalize to 0.5-1.5
             total_weight += num_samples * rep
-        
+
         # Weighted sum
         for client_id, num_samples, state_dict in decompressed:
             rep = reputations.get(client_id, 50.0) / 50.0  # Normalize to 0.5-1.5
             weight = (num_samples * rep) / total_weight  # Single normalized weight
-            
+
             for key in aggregated:
                 if key in state_dict:
                     val = state_dict[key]
@@ -264,10 +320,10 @@ class GradientAggregator:
                         aggregated[key] = aggregated[key] + val.float() * weight
                     elif isinstance(val, np.ndarray):
                         aggregated[key] = aggregated[key] + val * weight
-        
+
         # Serialize
         serialized = pickle.dumps(aggregated)
-        
+
         stats = {
             "status": "success",
             "method": self.method,
@@ -275,7 +331,7 @@ class GradientAggregator:
             "total_samples": total_samples,
             "aggregated_size": len(serialized),
         }
-        
+
         return serialized, stats
 
 
@@ -286,61 +342,71 @@ class GradientAggregator:
 class FederatedServer:
     """
     Main federated learning server.
-    
+
     Coordinates federated rounds: receives gradients from clients,
     aggregates them, updates the global model, and distributes updates.
     """
-    
+
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or DEFAULT_CONFIG.copy()
-        
+
         self.clients: Dict[str, ClientInfo] = {}
         self.round_state: Dict[int, RoundState] = {}
         self.metrics = ServerMetrics()
-        
+
         self.validator = GradientValidator(self.config)
-        self.aggregator = GradientAggregator(self.config.get("aggregation_method", "fedavg"))
-        
+        self.aggregator = GradientAggregator(
+            method=self.config.get("aggregation_method", "fedavg"),
+            gradient_privacy=self.gradient_privacy,
+            dp_enabled=self.dp_config.enabled,
+            dp_config=self.dp_config,
+        )
+
         self.current_model: Optional[bytes] = None
         self.global_round: int = 0
         self.compression_method = self.config.get("compression_method", "none")
         self.compression_k = self.config.get("compression_k", 0.1)
         self.compression_bits = self.config.get("compression_bits", 8)
-        
+
+        # Differential privacy
+        self.dp_config = config.get("dp_config") or DPConfig(enabled=False)
+        self.gradient_privacy = GradientPrivacy(self.dp_config)
+        self._dp_rounds: int = 0  # tracks rounds for epsilon computation
+
         self._lock = threading.RLock()
-        
+
         # Directories
         self.checkpoint_dir = Path(self.config.get("checkpoint_dir", "checkpoints"))
         self.log_dir = Path(self.config.get("log_dir", "logs"))
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Load model
         self._init_model()
-        
+
         logger.info(f"FederatedServer initialized (model={self.config['model_name']})")
         logger.info(f"  Rounds: {self.config['num_rounds']}")
         logger.info(f"  Min clients/round: {self.config['min_clients_per_round']}")
         logger.info(f"  Checkpoint dir: {self.checkpoint_dir}")
-    
+
     def _init_model(self):
         """Initialize or load the global model."""
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-        
+
         model_name = self.config["model_name"]
         logger.info(f"Loading global model: {model_name}")
-        
+
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
-            
+
             config = AutoConfig.from_pretrained(model_name)
             config.hidden_size = min(config.hidden_size, 512)
             config.num_attention_heads = min(config.num_attention_heads, 8)
             config.num_hidden_layers = min(config.num_hidden_layers, 6)
-            
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 config=config,
@@ -348,15 +414,15 @@ class FederatedServer:
                 torch_dtype=torch.float32,
                 ignore_mismatched_sizes=True,
             )
-            
+
             # Save initial model
             self._save_model(0)
             logger.info(f"Model loaded: {sum(p.numel() for p in self.model.parameters()):,} params")
-            
+
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise
-    
+
     def _save_model(self, round_num: int):
         """Save model checkpoint."""
         import torch
@@ -365,13 +431,13 @@ class FederatedServer:
         torch.save(state, path)
         self.current_model = pickle.dumps(state)
         logger.info(f"Model saved: {path}")
-    
+
     def _get_lock(self):
         """Get or create the server lock (lazy initialization for tests)."""
         if not hasattr(self, '_lock'):
             self._lock = threading.RLock()
         return self._lock
-    
+
     def register_client(self, client_id: str) -> Dict:
         """Register a new client."""
         with self._get_lock():
@@ -386,13 +452,13 @@ class FederatedServer:
                 self.metrics.clients_registered += 1
                 self.metrics.active_clients += 1
                 logger.info(f"Registered client: {client_id}")
-        
+
         return {"status": "registered", "client_id": client_id}
-    
+
     def receive_gradient(self, update: Dict) -> Dict:
         """
         Receive a gradient update from a client.
-        
+
         This is called when a client submits their gradient.
         """
         client_id = update.get("client_id", "unknown")
@@ -413,14 +479,14 @@ class FederatedServer:
 
             # Validate update
             is_valid, reason = self.validator.validate(client_id, update)
-            
+
             # Record gradient norm
             self.validator.record_norm(client_id, update.get("gradient_norm", 0))
-            
+
             # Store pending gradient
             if client_id in self.clients:
                 self.clients[client_id].pending_gradient = update
-            
+
             # Update round state
             if round_num not in self.round_state:
                 self.round_state[round_num] = RoundState(
@@ -428,111 +494,124 @@ class FederatedServer:
                     status="collecting",
                     started_at=time.time(),
                 )
-            
+
             rs = self.round_state[round_num]
             rs.gradients_received += 1
             rs.gradients_accepted += 1
             rs.clients_joined.append(client_id)
-            
+
             self.metrics.total_gradients_received += 1
-            
+
             # Update client stats
             if client_id in self.clients:
                 self.clients[client_id].rounds_participated += 1
                 self.clients[client_id].total_samples_contributed += update.get("num_samples", 0)
-            
+
             logger.info(
                 f"Received gradient from {client_id} (round {round_num}): "
                 f"norm={update.get('gradient_norm', 0):.4f}, "
                 f"samples={update.get('num_samples', 0)}"
             )
-            
+
             # Check if we have enough gradients to aggregate
             min_clients = self.config.get("min_clients_per_round", 2)
             if len(set(rs.clients_joined)) >= min_clients and rs.status == "collecting":
                 self._start_aggregation(round_num)
-            
+
             return {"status": "accepted", "round": round_num}
-    
+
     def _start_aggregation(self, round_num: int):
         """Start aggregating gradients for a round."""
         rs = self.round_state[round_num]
         rs.status = "aggregating"
-        
+
         logger.info(f"Starting aggregation for round {round_num}")
-        
+
         # Collect all pending gradients
         updates = []
         for cid in set(rs.clients_joined):
             if cid in self.clients and self.clients[cid].pending_gradient:
                 updates.append(self.clients[cid].pending_gradient)
-        
+
         # Get reputations
         reputations = {c.client_id: c.reputation for c in self.clients.values()}
-        
+
         # Aggregate
         aggregated, stats = self.aggregator.aggregate(updates, reputations)
-        
+
         if aggregated is None:
             rs.status = "failed"
             logger.error(f"Aggregation failed for round {round_num}")
             return
-        
+
+        # Privacy budget accounting
+        if self.dp_config.enabled:
+            self._dp_rounds += 1
+            eps = GradientPrivacy.compute_epsilon(
+                self.dp_config.noise_multiplier, self._dp_rounds
+            )
+            status = self.gradient_privacy.privacy_status(self._dp_rounds)
+            logger.info(
+                f"Round {round_num}: ε={eps:.2f} (δ=1e-5) [{status['strength']} privacy]"
+            )
+            for warning in status.get("warnings", []):
+                logger.warning(warning)
+
         # Apply to global model
         self._apply_gradient(aggregated)
-        
+
         # Save checkpoint
         self._save_model(round_num)
-        
+
         # Complete round
         rs.status = "done"
         rs.completed_at = time.time()
         rs.aggregated_gradient = aggregated
-        
+
         # Clear pending gradients
         for cid in self.clients:
             self.clients[cid].pending_gradient = None
-        
+
         # Update metrics
         self.global_round = round_num
         self.metrics.total_rounds += 1
-        
+
         round_time = rs.completed_at - rs.started_at
         self.metrics.avg_round_time = (
             (self.metrics.avg_round_time * (self.metrics.total_rounds - 1) + round_time)
             / self.metrics.total_rounds
         )
-        
+
         logger.info(
             f"Round {round_num} complete: "
             f"{stats['num_updates']} updates, "
             f"{round_time:.1f}s, "
             f"model updated"
         )
-    
+
     def _apply_gradient(self, gradient_bytes: bytes):
         """Apply aggregated gradient to global model."""
         import torch
-        
+
         state_dict = pickle.loads(gradient_bytes)
-        
+
         # Simple SGD update
         current_state = self.model.state_dict()
         lr = 0.01
-        
+
         for key in current_state:
             if key in state_dict:
                 grad = state_dict[key]
                 if isinstance(grad, np.ndarray):
                     grad = torch.from_numpy(grad)
                 current_state[key] = current_state[key].float() + lr * grad.float()
-        
+
         self.model.load_state_dict(current_state)
-    
+
     def get_model_update(self, client_id: str, since_round: int = 0) -> Optional[Dict]:
         """
         Get the latest model update for a client.
-        
+
         Returns serialized model state dict or None.
         """
         with self._get_lock():
@@ -544,13 +623,13 @@ class FederatedServer:
                     "model_size": len(self.current_model),
                 }
             return None
-    
+
     def get_status(self) -> Dict:
         """Get server status."""
         with self._get_lock():
             active = sum(1 for c in self.clients.values() if c.is_active)
-            
-            return {
+
+            status = {
                 "global_round": self.global_round,
                 "num_rounds": self.config["num_rounds"],
                 "clients_registered": self.metrics.clients_registered,
@@ -565,13 +644,29 @@ class FederatedServer:
                     "aggregation_method": self.config["aggregation_method"],
                 },
             }
-    
+
+            if self.dp_config.enabled:
+                eps = GradientPrivacy.compute_epsilon(
+                    self.dp_config.noise_multiplier, self._dp_rounds
+                )
+                status["differential_privacy"] = {
+                    "enabled": True,
+                    "noise_multiplier": self.dp_config.noise_multiplier,
+                    "max_grad_norm": self.dp_config.max_grad_norm,
+                    "rounds_completed": self._dp_rounds,
+                    "epsilon_estimate": round(eps, 4),
+                }
+            else:
+                status["differential_privacy"] = {"enabled": False}
+
+            return status
+
     def get_round_status(self, round_num: int) -> Optional[Dict]:
         """Get status of a specific round."""
         with self._get_lock():
             if round_num not in self.round_state:
                 return None
-            
+
             rs = self.round_state[round_num]
             return {
                 "round_number": rs.round_number,
@@ -607,7 +702,7 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
       - Round continues with remaining clients
     """
 
-    # Socket timeout for recv operations (seconds) — prevents hanging forever
+    # Socket timeout for recv operations (seconds) - prevents hanging forever
     SOCKET_TIMEOUT = 30
 
     def handle(self):
@@ -656,6 +751,14 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
 
             logger.info(f"[{client_id}] Socket connected (round {round_num}, type={msg_type})")
 
+            # Log if DP is enabled on the server
+            if server.dp_config.enabled:
+                logger.info(
+                    f"[{client_id}] DP enabled on server: "
+                    f"noise_mult={server.dp_config.noise_multiplier}, "
+                    f"clip_norm={server.dp_config.max_grad_norm}"
+                )
+
             if msg_type == "gradients":
                 self._handle_gradients(server, lock, client_id, round_num)
             elif msg_type == "disconnect":
@@ -668,7 +771,7 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
                 logger.warning(f"[{client_id}] Unknown message type: {msg_type}")
 
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
-            # Client disconnected mid-round — mark as disconnected, don't crash
+            # Client disconnected mid-round - mark as disconnected, don't crash
             logger.warning(f"[{client_id}] Client disconnected (round {round_num}): {e}")
             self._mark_client_disconnected(server, lock, client_id, round_num)
         except Exception as e:
@@ -696,10 +799,10 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
                     return data
                 data += chunk
             except socket.timeout:
-                # Timed out waiting for data — return what we have
+                # Timed out waiting for data - return what we have
                 return data
             except (ConnectionResetError, BrokenPipeError, OSError):
-                # Client disconnected — return what we have
+                # Client disconnected - return what we have
                 return data
         return data
 
@@ -806,7 +909,7 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
             if len(set(rs.clients_joined)) >= min_clients and rs.status == "collecting":
                 self._aggregate_and_respond(server, lock, round_num, client_id)
             else:
-                # Not enough clients yet — wait briefly then respond
+                # Not enough clients yet - wait briefly then respond
                 time.sleep(0.5)
                 self._aggregate_and_respond(server, lock, round_num, client_id)
 
@@ -833,7 +936,7 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
             disconnected = list(set(rs.clients_joined) - set(active_joined))
 
             if rs.status == "collecting":
-                # Timeout reached or enough clients — aggregate with whoever we have
+                # Timeout reached or enough clients - aggregate with whoever we have
                 disconnected_names = ", ".join(disconnected) if disconnected else "none"
                 if len(active_joined) < total_joined:
                     logger.warning(
@@ -844,7 +947,7 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
                     min_req = server.config.get("min_clients_per_round", 2)
                     logger.warning(
                         f"Round {round_num}: fewer clients ({len(active_joined)}) than "
-                        f"min_clients ({min_req}) — proceeding anyway"
+                        f"min_clients ({min_req}) - proceeding anyway"
                     )
 
                 updates = []
@@ -862,7 +965,7 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
                     disc_names = ", ".join(disconnected) if disconnected else ""
                     logger.info(
                         f"Round {round_num}: {len(updates)}/{total_joined} clients contributed "
-                        f"({disc_names} disconnected) — aggregated"
+                        f"({disc_names} disconnected) - aggregated"
                     )
                 else:
                     aggregated = None
@@ -949,9 +1052,9 @@ class FederatedSocketServer(socketserver.ThreadingTCPServer):
         self.auth_token = auth_token
         super().__init__(("0.0.0.0", port), FederatedSocketHandler)
         if self.auth_token:
-            logger.info(f"Socket server auth token is set — client authentication enabled")
+            logger.info(f"Socket server auth token is set - client authentication enabled")
         else:
-            logger.info(f"Socket server auth token is NOT set — clients will connect without authentication")
+            logger.info(f"Socket server auth token is NOT set - clients will connect without authentication")
         logger.info(f"Socket server listening on port {port}")
 
     def server_close(self):
@@ -972,22 +1075,22 @@ if FASTAPI_AVAILABLE:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    
+
     _server: Optional[FederatedServer] = None
-    
+
     @app.on_event("startup")
     async def startup():
         global _server
         _server = FederatedServer()
-    
+
     @app.get("/")
     async def root():
         return {"message": "LISA Federated Learning Server", "status": "running"}
-    
+
     @app.get("/status")
     async def status():
         return _server.get_status()
-    
+
     @app.post("/register")
     async def register(request: Request):
         body = await request.json()
@@ -995,12 +1098,12 @@ if FASTAPI_AVAILABLE:
         if not client_id:
             raise HTTPException(status_code=400, detail="client_id required")
         return _server.register_client(client_id)
-    
+
     @app.post("/submit")
     async def submit(request: Request):
         body = await request.json()
         return _server.receive_gradient(body)
-    
+
     @app.get("/model/{client_id}")
     async def get_model(client_id: str, since_round: int = 0):
         update = _server.get_model_update(client_id, since_round)
@@ -1010,7 +1113,7 @@ if FASTAPI_AVAILABLE:
             "round": update["round"],
             "model_size": update["model_size"],
         })
-    
+
     @app.get("/round/{round_num}")
     async def get_round(round_num: int):
         status = _server.get_round_status(round_num)
@@ -1026,15 +1129,15 @@ if FASTAPI_AVAILABLE:
 class DemoFederatedSimulator:
     """
     Simulate a full federated learning run without HTTP.
-    
+
     Useful for testing on a single machine.
     """
-    
+
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or DEFAULT_CONFIG.copy()
         self.server = FederatedServer(config)
         self.clients: Dict[str, Any] = {}
-    
+
     def add_client(self, client_id: str):
         """Add a simulated client."""
         # Import client class
@@ -1047,33 +1150,33 @@ class DemoFederatedSimulator:
         self.clients[client_id] = client
         self.server.register_client(client_id)
         return client
-    
+
     def run_round(self, round_num: int) -> Dict:
         """Run one federated round with all clients."""
         logger.info(f"\n{'='*60}")
         logger.info(f"ROUND {round_num}")
         logger.info(f"{'='*60}")
-        
+
         # Each client computes gradient
         for client_id, client in self.clients.items():
             logger.info(f"  {client_id}: computing gradient...")
             update = client.train_and_submit(round_num)
-            
+
             # Server receives gradient
             self.server.receive_gradient(update)
-        
+
         # Aggregation happens automatically when min clients submit
         rs = self.server.round_state.get(round_num)
         if rs:
             while rs.status == "collecting":
                 time.sleep(0.1)
-        
+
         # Get round result
         result = self.server.get_round_status(round_num)
         logger.info(f"  Round {round_num} result: {result}")
-        
+
         return result or {}
-    
+
     def run(self, num_rounds: int = 3) -> Dict:
         """Run full federated training simulation."""
         logger.info(f"\n{'='*60}")
@@ -1083,15 +1186,15 @@ class DemoFederatedSimulator:
         logger.info(f"Rounds: {num_rounds}")
         logger.info(f"Model: {self.config['model_name']}")
         logger.info(f"{'='*60}\n")
-        
+
         results = []
         for r in range(1, num_rounds + 1):
             result = self.run_round(r)
             results.append(result)
-        
+
         # Final status
         status = self.server.get_status()
-        
+
         logger.info(f"\n{'='*60}")
         logger.info(f"TRAINING COMPLETE")
         logger.info(f"{'='*60}")
@@ -1099,7 +1202,7 @@ class DemoFederatedSimulator:
         logger.info(f"Gradients received: {status['total_gradients_received']}")
         logger.info(f"Avg round time: {status['avg_round_time']:.1f}s")
         logger.info(f"Model size: {status['current_model_size_mb']:.1f} MB")
-        
+
         return {
             "status": "complete",
             "results": results,
@@ -1113,7 +1216,7 @@ class DemoFederatedSimulator:
 
 def main():
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Federated Learning Server")
     parser.add_argument("--mode", choices=["server", "demo", "socket"], default="demo")
     parser.add_argument("--host", default="0.0.0.0")
@@ -1133,6 +1236,12 @@ def main():
                         help="Sparsification ratio K (fraction to keep, e.g. 0.1 = keep top 10%%)")
     parser.add_argument("--compression-bits", type=int, default=8,
                         help="Quantization bits (8 or 16)")
+    parser.add_argument("--dp", action="store_true",
+                        help="Enable differential privacy (Gaussian mechanism)")
+    parser.add_argument("--noise-multiplier", type=float, default=1.0,
+                        help="DP noise multiplier σ (default 1.0, higher = more privacy, more noise)")
+    parser.add_argument("--max-grad-norm", type=float, default=1.0,
+                        help="DP per-gradient clipping bound C (default 1.0)")
     parser.add_argument("--gen-token", action="store_true",
                         help="Generate a random auth token and exit")
 
@@ -1142,7 +1251,7 @@ def main():
         token = secrets.token_urlsafe(32)
         print(token)
         sys.exit(0)
-    
+
     config = DEFAULT_CONFIG.copy()
     config["model_name"] = args.model
     config["num_rounds"] = args.rounds
@@ -1153,51 +1262,64 @@ def main():
     config["compression_k"] = args.compression_k
     config["compression_bits"] = args.compression_bits
 
+    # Differential privacy
+    if args.dp:
+        dp_cfg = DPConfig(
+            enabled=True,
+            noise_multiplier=args.noise_multiplier,
+            max_grad_norm=args.max_grad_norm,
+        )
+        config["dp_config"] = dp_cfg
+        logger.info(
+            f"DP enabled: noise_multiplier={args.noise_multiplier}, "
+            f"max_grad_norm={args.max_grad_norm}"
+        )
+
     if args.mode == "server":
         if not FASTAPI_AVAILABLE:
             print("Error: fastapi not installed. Install with: pip install fastapi uvicorn")
             sys.exit(1)
-        
+
         server = FederatedServer(config)
         app._server = server  # type: ignore
-        
+
         print(f"Starting HTTP server on {args.host}:{args.port}")
         uvicorn.run(app, host=args.host, port=args.port)
-    
+
     elif args.mode == "socket":
         # Socket-based server for fed_client.py
         print(f"Loading model: {args.model} ...")
         server = FederatedServer(config)
-        
+
         print(f"Starting socket server on {args.host}:{args.port}")
         socket_server = FederatedSocketServer(server, port=args.port, auth_token=args.auth_token)
-        
+
         print(f"Federated socket server running on port {args.port}")
         print(f"  Model: {args.model}")
         print(f"  Rounds: {args.rounds}")
         print(f"  Min clients/round: {args.min_clients}")
         print(f"  Waiting for clients...")
         print(f"Press Ctrl+C to stop.")
-        
+
         try:
             socket_server.serve_forever()
         except KeyboardInterrupt:
             print("\nShutting down...")
             socket_server.shutdown()
-    
+
     else:
         # Demo mode (in-process, no network)
         sim = DemoFederatedSimulator(config)
-        
+
         # Add simulated clients
         for i in range(1, args.clients + 1):
             client_id = f"client-{i}"
             sim.add_client(client_id)
             logger.info(f"Added client: {client_id}")
-        
+
         # Run simulation
         results = sim.run(args.rounds)
-        
+
         print("\n=== RESULTS ===")
         print(json.dumps(results["final_status"], indent=2))
 
