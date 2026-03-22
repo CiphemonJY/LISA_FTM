@@ -96,8 +96,8 @@ def main():
                 parent = model.get_submodule(parent_name)
                 setattr(parent, attr, lora)
                 lora_count += 1
-            except (KeyError, AttributeError):
-                pass
+            except (KeyError, AttributeError) as e:
+                log.debug(f"Could not apply LoRA to {full_name}: {e}")
 
     log.info(f"  LoRA applied to {lora_count} layers")
 
