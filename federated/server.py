@@ -661,33 +661,31 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
 
     def _handle_gradients(self, server, lock, client_id: str, round_num: int):
         """Receive gradients, aggregate, send update back."""
-        # --- Step 2: receive number of tensors ---
+        # --- Step 2: receive pickle-serialized gradient dict ---
         n_header = self._recv_exact(4)
         if len(n_header) < 4:
             return
-        n_tensors = struct.unpack("!I", n_header)[0]
-        logger.info(f"[{client_id}] Receiving {n_tensors} gradient tensors")
-
-        # Receive tensors into a state dict
-        grad_state = {}
-        for _ in range(n_tensors):
-            name, tensor = self._recv_tensor()
-            grad_state[name] = tensor
+        n_bytes = struct.unpack("!I", n_header)[0]
+        raw = b""
+        while len(raw) < n_bytes:
+            chunk = self.request.recv(min(65536, n_bytes - len(raw)))
+            if not chunk:
+                break
+            raw += chunk
+        grad_state = pickle.loads(raw)
+        logger.info(f"[{client_id}] Received {len(grad_state)} gradient tensors (pickle)")
 
         # Register client
         server.register_client(client_id)
 
         # Build gradient update dict for FederatedServer.receive_gradient
-        # We store gradients as a dict (not compressed) so receive_gradient
-        # can pass them directly to the aggregator
-        import base64 as _base64
         grad_norm = float(torch.norm(torch.cat([t.flatten() for t in grad_state.values()])).item())
         update = {
             "client_id": client_id,
             "round_number": round_num,
             "num_samples": 100,  # default; real clients may send more
             "gradient_norm": grad_norm,
-            "gradient_data": grad_state,  # dict: will be handled specially
+            "gradient_data": grad_state,  # dict: will be handled specially by aggregator
         }
 
         with lock:
@@ -765,11 +763,11 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
         # Build model update response
         if server.current_model:
             state = pickle.loads(server.current_model)
-            # Only send lora_ parameters to reduce bandwidth
-            lora_tensors = {k: v for k, v in state.items() if "lora_" in k}
-            if not lora_tensors:
-                lora_tensors = state  # fallback: send all
-            update_tensors = lora_tensors
+            # Send full state dict (shapes preserved through pickle round-trip)
+            update_tensors = state
+        elif rs.aggregated_gradient:
+            # Aggregated gradients from this round
+            update_tensors = pickle.loads(rs.aggregated_gradient)
         else:
             update_tensors = {}
 
@@ -784,11 +782,9 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
         response_bytes = json.dumps(response_meta).encode("utf-8")
         self.request.sendall(struct.pack("!I", len(response_bytes)) + response_bytes)
 
-        # --- Step 5: send tensor frames ---
-        self.request.sendall(struct.pack("!I", len(update_tensors)))
-        for name, tensor in update_tensors.items():
-            t = tensor.float().cpu().reshape(-1)
-            self._send_tensor(name, t)
+        # --- Step 5: send pickle-serialized state dict (preserves shapes) ---
+        response_data = pickle.dumps(update_tensors)
+        self.request.sendall(struct.pack("!I", len(response_data)) + response_data)
 
         logger.info(f"[{self.client_address}] Update sent for round {round_num}")
 

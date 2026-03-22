@@ -6,7 +6,7 @@ Connects to federated server, trains LoRA layers, sends gradients.
 This PC (8GB RAM, CPU-only) contributes to training a 1.1B param model
 by training locally and sharing gradients with the federation.
 """
-import os, sys, time, torch, logging, socket, json, struct
+import os, sys, time, torch, logging, socket, json, struct, pickle
 from pathlib import Path
 
 logging.basicConfig(
@@ -75,22 +75,14 @@ class FederatedClient:
         return json.loads(data.decode("utf-8"))
 
     def send_gradients(self, gradients: dict):
-        """Send gradient dict to server."""
+        """Send gradient dict to server using torch serialization (preserves shapes)."""
         self.send_json({"type": "gradients", "client_id": CLIENT_ID, "round": self.round_num})
-        # Send tensor count first, then each tensor
-        tensors = [(n, t) for n, t in gradients.items() if isinstance(t, torch.Tensor)]
-        self.sock.sendall(struct.pack("!I", len(tensors)))
-        for name, tensor in tensors:
-            data = tensor.cpu().numpy().tobytes()
-            name_bytes = name.encode("utf-8")
-            self.sock.sendall(struct.pack("!I", len(name_bytes)) + name_bytes)
-            self.sock.sendall(struct.pack("!I", len(data)) + data)
+        # Serialize with pickle (preserves tensor shapes)
+        data = pickle.dumps(gradients)
+        self.sock.sendall(struct.pack("!I", len(data)) + data)
 
     def recv_model_update(self) -> dict:
-        """Receive aggregated model update from server.
-        
-        Server sends: JSON with n_tensors, then n_tensors count, then each tensor.
-        """
+        """Receive aggregated model update from server (pickle-serialized dict)."""
         grads = {}
         # Receive JSON header + body
         header = self.sock.recv(4)
@@ -110,32 +102,20 @@ class FederatedClient:
         except Exception as e:
             log.warning(f"Failed to parse server response JSON: {e}")
             return grads
-        
-        # Receive tensor count
+
+        # Receive pickle data
         n_header = self.sock.recv(4)
         if len(n_header) < 4:
             return grads
-        n_tensors = struct.unpack("!I", n_header)[0]
-        log.info(f"  Receiving {n_tensors} model tensors...")
-        
-        for _ in range(n_tensors):
-            name_len_data = self.sock.recv(4)
-            if len(name_len_data) < 4:
+        n_bytes = struct.unpack("!I", n_header)[0]
+        raw = b""
+        while len(raw) < n_bytes:
+            chunk = self.sock.recv(min(65536, n_bytes - len(raw)))
+            if not chunk:
                 break
-            name_len = struct.unpack("!I", name_len_data)[0]
-            name = self.sock.recv(name_len).decode("utf-8")
-            size_data = self.sock.recv(4)
-            if len(size_data) < 4:
-                break
-            size = struct.unpack("!I", size_data)[0]
-            data = b""
-            while len(data) < size:
-                chunk = self.sock.recv(min(65536, size - len(data)))
-                if not chunk:
-                    break
-                data += chunk
-            import numpy as np
-            grads[name] = torch.from_numpy(np.frombuffer(data, dtype=np.float32))
+            raw += chunk
+        if raw:
+            grads = pickle.loads(raw)
         return grads
 
     def load_model(self) -> bool:
