@@ -271,17 +271,31 @@ def tokenize_texts(tokenizer, texts: List[str], max_seq: int) -> Dict[str, torch
     }
 
 
-def partition_data(texts: List[str], n: int, seed: int = 42) -> List[List[str]]:
-    rng = random.Random(seed)
-    shuffled = texts.copy()
-    rng.shuffle(shuffled)
-    size = len(shuffled) // n
-    partitions = []
-    for i in range(n):
-        start = i * size
-        end = start + size if i < n - 1 else len(shuffled)
-        partitions.append(shuffled[start:end])
-    return partitions
+def partition_data(texts: List[str], n: int, seed: int = 42, non_iid: bool = False) -> List[List[str]]:
+    """
+    Partition texts across n clients.
+    non_iid=True: sequential topic slices (client 0 = samples 0-400,
+    client 1 = 400-800, client 2 = 800-1200) to simulate non-IID data skew.
+    """
+    if non_iid:
+        size = 400
+        partitions = []
+        for i in range(n):
+            start = i * size
+            end = start + size if i < n - 1 else len(texts)
+            partitions.append(texts[start:end])
+        return partitions
+    else:
+        rng = random.Random(seed)
+        shuffled = texts.copy()
+        rng.shuffle(shuffled)
+        size = len(shuffled) // n
+        partitions = []
+        for i in range(n):
+            start = i * size
+            end = start + size if i < n - 1 else len(shuffled)
+            partitions.append(shuffled[start:end])
+        return partitions
 
 
 # ---------------------------------------------------------------------------

@@ -616,6 +616,9 @@ def test_federated_server():
         server.current_model = None
         server.global_round = 0
         
+        from utils.audit_logger import AuditLogger
+        server.audit_logger = AuditLogger(audit_dir=str(server.log_dir / "audit"))
+        
         from server import GradientAggregator, GradientValidator
         server.validator = GradientValidator(config)
         server.aggregator = GradientAggregator("fedavg")
@@ -774,6 +777,9 @@ def test_full_pipeline():
     server.current_model = None
     server.global_round = 0
     server._lock = threading.RLock()
+    
+    from utils.audit_logger import AuditLogger
+    server.audit_logger = AuditLogger(audit_dir=str(server.log_dir / "audit"))
     
     from server import GradientAggregator, GradientValidator
     server.validator = GradientValidator(config)

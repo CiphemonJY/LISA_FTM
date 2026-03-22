@@ -356,7 +356,9 @@ class FederatedServer:
     aggregates them, updates the global model, and distributes updates.
     """
 
-    def __init__(self, config: Optional[Dict] = None):
+    def __init__(self, config: Optional[Dict | str] = None):
+        if isinstance(config, str):
+            config = {"model_name": config}
         self.config = config or DEFAULT_CONFIG.copy()
 
         self.clients: Dict[str, ClientInfo] = {}
