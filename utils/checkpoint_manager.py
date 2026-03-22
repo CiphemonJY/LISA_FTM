@@ -15,6 +15,16 @@ import torch
 import pickle
 
 
+def _generate_model_card_from_checkpoint(ckpt_path: Path) -> None:
+    """Generate a model card for the checkpoint (best-effort)."""
+    try:
+        from utils.model_card import generate_model_card
+        generate_model_card(str(ckpt_path))
+    except Exception:
+        # Never fail a checkpoint save due to model card issues
+        pass
+
+
 class CheckpointManager:
     """
     Manages versioned model checkpoints with rollback support.
@@ -93,6 +103,9 @@ class CheckpointManager:
             meta_path = ckpt_path / "metadata.json"
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=2, default=str)
+
+            # Auto-generate model card (best-effort)
+            _generate_model_card_from_checkpoint(ckpt_path)
 
             return checkpoint_id
 
