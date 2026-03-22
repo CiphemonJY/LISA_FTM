@@ -421,13 +421,16 @@ def aggregate_deltas(
         for k, v in delta.items():
             acc[k] = acc.get(k, torch.zeros_like(v)) + v.float() * w
 
-    # Apply to server model
+    # Apply to server model — scale by SERVER_LR to account for clients doing
+    # multiple local steps before sharing gradients. Without this, the delta
+    # is the sum of all client optimizer steps, which makes p.data jump too far.
+    SERVER_LR = 0.1
     for full_name, lora_layer in wrapper.lora_layers.items():
         for suffix in ["lora_A", "lora_B"]:
             key = f"{full_name}.{suffix}"
             if key in acc:
                 with torch.no_grad():
-                    getattr(lora_layer, suffix).add_(acc[key])
+                    getattr(lora_layer, suffix).add_(acc[key] * SERVER_LR)
 
 
 # ---------------------------------------------------------------------------
