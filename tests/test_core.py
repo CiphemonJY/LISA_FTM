@@ -264,10 +264,9 @@ def test_fedavg_averages_correctly():
     Simulate 3 clients sending gradient tensors.
     Verify aggregation produces consistent results.
 
-    Note: the aggregator applies weighted sum with weight = num_samples/total
-    then normalizes by total_rep/50. With equal sample counts (100 each)
-    and equal reputations (50 each), the expected result is the
-    element-wise sum divided by the number of clients (3).
+    The corrected FedAvg: each client's contribution weight =
+    (num_samples * rep_factor) / total_weight, where rep_factor = rep/50.
+    No second normalization pass — only one division.
     """
     from federated.server import GradientAggregator, DEFAULT_CONFIG
 
@@ -305,11 +304,13 @@ def test_fedavg_averages_correctly():
     aggregated = pickle.loads(aggregated_bytes)
 
     # With equal gradients [3,6,9], equal samples, equal rep=50:
-    # weight = 100/300 = 1/3, rep_factor = 50/50 = 1
+    # rep_factor = 50/50 = 1
+    # total_weight = 100*1 + 100*1 + 100*1 = 300
+    # each client's weight = (100*1)/300 = 1/3
     # pre-norm = 3 * (1/3) * [3,6,9] = [3,6,9]
-    # normalized by (150/50) = 3  =>  [1,2,3]
-    expected_weight = torch.tensor([1.0, 2.0, 3.0])
-    expected_bias = torch.tensor([0.5])
+    # NO second division (fixed from old buggy double-normalization)
+    expected_weight = torch.tensor([3.0, 6.0, 9.0])
+    expected_bias = torch.tensor([1.5])
 
     assert torch.allclose(aggregated["layer.weight"].float(), expected_weight, atol=1e-4), \
         f"weight mismatch: {aggregated['layer.weight']} vs {expected_weight}"
@@ -322,7 +323,7 @@ def test_fedavg_averages_correctly():
 def test_fedavg_respects_sample_weights():
     """
     Client sends 200 samples vs 100 samples.
-    Weighted average should reflect sample counts (after double-normalization).
+    Weighted average should reflect sample counts (single normalization).
     """
     from federated.server import GradientAggregator
 
@@ -340,10 +341,12 @@ def test_fedavg_respects_sample_weights():
     aggregated_bytes, stats = aggregator.aggregate(updates, reputations)
     aggregated = pickle.loads(aggregated_bytes)
 
-    # With equal reputations:
-    # pre-norm: (200/300)*1*[3,3] + (100/300)*1*[6,6] = [2,2] + [2,2] = [4,4]
-    # normalized by total_rep/50 = 100/50 = 2  =>  [2, 2]
-    expected = torch.tensor([2.0, 2.0])
+    # With equal reputations (rep=50 each, rep_factor=1):
+    # total_weight = 200*1 + 100*1 = 300
+    # c1 weight = 200/300 = 2/3, c2 weight = 100/300 = 1/3
+    # pre-norm = (2/3)*[3,3] + (1/3)*[6,6] = [2,2] + [2,2] = [4,4]
+    # NO second division (fixed from old buggy double-normalization)
+    expected = torch.tensor([4.0, 4.0])
     assert torch.allclose(aggregated["layer.weight"].float(), expected, atol=1e-4), \
         f"Weighted average wrong: {aggregated['layer.weight']} vs {expected}"
 
@@ -584,6 +587,166 @@ def test_fedavg_handles_empty_updates():
 
 
 # ============================================================================
+# 8. Gradient Compression Tests
+# ============================================================================
+
+def test_compress_sparsify_roundtrip():
+    """Sparsification + decompress should recover approximate gradient values."""
+    from federated.compression import compress_sparsify, decompress_sparsify
+
+    grad_dict = {
+        "layer.weight": torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+        "layer.bias": torch.tensor([0.1, 0.2]),
+    }
+
+    compressed = compress_sparsify(grad_dict, k=0.5)
+    assert compressed['method'] == 'sparsify'
+    assert compressed['k'] == 0.5
+    assert compressed['total_kept'] < compressed['total_original']
+
+    decompressed = decompress_sparsify(compressed)
+    assert set(decompressed.keys()) == set(grad_dict.keys())
+
+    # Verify shapes are preserved
+    for name in grad_dict:
+        assert decompressed[name].shape == grad_dict[name].shape, \
+            f"Shape mismatch for {name}: {decompressed[name].shape} vs {grad_dict[name].shape}"
+
+    # Values at kept indices should match
+    sparse_data = compressed['data']
+    for name in grad_dict:
+        original = grad_dict[name].float().numpy().flatten()
+        indices = sparse_data[name]['indices']
+        recovered_values = decompressed[name].numpy().flatten()[indices]
+        sparse_values = sparse_data[name]['values']
+        assert np.allclose(recovered_values, sparse_values, atol=1e-4), \
+            f"Values mismatch for {name}"
+
+    print("[PASS] test_compress_sparsify_roundtrip")
+
+
+def test_compress_quantize_roundtrip():
+    """Quantization + decompress should recover close-to-original values."""
+    from federated.compression import compress_quantize, decompress_quantize
+
+    grad_dict = {
+        "layer.weight": torch.randn(10, 20) * 0.5,
+        "layer.bias": torch.randn(10) * 0.1,
+    }
+
+    for bits in [8, 16]:
+        compressed = compress_quantize(grad_dict, bits=bits)
+        assert compressed['method'] == 'quantize'
+        assert compressed['bits'] == bits
+
+        decompressed = decompress_quantize(compressed)
+        assert set(decompressed.keys()) == set(grad_dict.keys())
+
+        # Verify shapes preserved
+        for name in grad_dict:
+            assert decompressed[name].shape == grad_dict[name].shape
+
+        # Check reconstruction error is within quantization bounds
+        for name in grad_dict:
+            original = grad_dict[name].float()
+            recovered = decompressed[name].float()
+            max_err = (original - recovered).abs().max().item()
+            # For 8-bit: quantization step = range/255; error should be < step
+            step_8bit = (original.max() - original.min()).item() / 255.0 if bits == 8 else 0
+            err_tolerance = step_8bit * 2 + 1e-4
+            assert max_err < err_tolerance, \
+                f"[bits={bits}] Reconstruction error {max_err:.6f} too high for {name}"
+
+    print("[PASS] test_compress_quantize_roundtrip")
+
+
+def test_compress_both_roundtrip():
+    """Combined sparsify + quantize should still reconstruct correctly."""
+    from federated.compression import compress_both, decompress_both
+
+    grad_dict = {
+        "layer.weight": torch.randn(8, 16),
+        "layer.bias": torch.randn(8),
+    }
+
+    compressed = compress_both(grad_dict, k=0.2, bits=8)
+    assert compressed['method'] == 'both'
+
+    decompressed = decompress_both(compressed)
+    assert set(decompressed.keys()) == set(grad_dict.keys())
+
+    # Shapes preserved
+    for name in grad_dict:
+        assert decompressed[name].shape == grad_dict[name].shape
+
+    print("[PASS] test_compress_both_roundtrip")
+
+
+def test_compress_gradients_interface():
+    """Test the unified compress_gradients / decompress_gradients interface."""
+    from federated.compression import compress_gradients, decompress_gradients
+
+    grad_dict = {
+        "lora_A": torch.randn(4, 16),
+        "lora_B": torch.randn(8, 4),
+    }
+
+    for method in ["none", "sparsify", "quantize", "both"]:
+        compressed, metadata = compress_gradients(grad_dict, method=method, k=0.25, bits=8)
+        assert metadata['method'] == method
+
+        decompressed = decompress_gradients(compressed, metadata)
+        assert set(decompressed.keys()) == set(grad_dict.keys())
+
+        # Shapes preserved for all methods
+        for name in grad_dict:
+            assert decompressed[name].shape == grad_dict[name].shape, \
+                f"Shape mismatch for {name} in method={method}"
+
+    print("[PASS] test_compress_gradients_interface")
+
+
+def test_fedavg_no_double_normalization():
+    """
+    Verify the corrected FedAvg does NOT double-normalize.
+    
+    The old bug: weight = num_samples/total, then a second division by total_rep/50.
+    The fix: single normalized weight = (num_samples * rep_factor) / total_weight.
+    
+    This test uses unequal reputations to expose the double-normalization bug.
+    """
+    from federated.server import GradientAggregator
+
+    aggregator = GradientAggregator(method="fedavg")
+
+    # Client 1: 100 samples, rep=100 (high rep, high weight)
+    # Client 2: 100 samples, rep=25  (low rep, low weight)
+    client1_state = {"layer.weight": torch.tensor([10.0, 10.0])}
+    client2_state = {"layer.weight": torch.tensor([0.0, 0.0])}  # zero gradient
+
+    updates = [
+        {"client_id": "c1", "num_samples": 100, "gradient_data": client1_state},
+        {"client_id": "c2", "num_samples": 100, "gradient_data": client2_state},
+    ]
+    reputations = {"c1": 100.0, "c2": 25.0}
+
+    aggregated_bytes, _ = aggregator.aggregate(updates, reputations)
+    aggregated = pickle.loads(aggregated_bytes)
+
+    # rep_factor_c1 = 100/50 = 2.0
+    # rep_factor_c2 = 25/50 = 0.5
+    # total_weight = 100*2 + 100*0.5 = 200 + 50 = 250
+    # c1_weight = 200/250 = 0.8
+    # pre-norm = 0.8 * [10,10] + 0.2 * [0,0] = [8,8]
+    # NO second division
+    expected = torch.tensor([8.0, 8.0])
+    assert torch.allclose(aggregated["layer.weight"].float(), expected, atol=1e-4), \
+        f"Single normalization wrong: {aggregated['layer.weight']} vs {expected}"
+
+    print("[PASS] test_fedavg_no_double_normalization")
+
+
+# ============================================================================
 # pytest entry points
 # ============================================================================
 
@@ -602,6 +765,11 @@ if __name__ == "__main__":
         test_tensor_ndims_and_dtypes,
         test_gradient_validator_rejects_bad_norms,
         test_fedavg_handles_empty_updates,
+        test_compress_sparsify_roundtrip,
+        test_compress_quantize_roundtrip,
+        test_compress_both_roundtrip,
+        test_compress_gradients_interface,
+        test_fedavg_no_double_normalization,
     ]
 
     failed = []

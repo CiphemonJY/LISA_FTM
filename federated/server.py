@@ -234,7 +234,7 @@ class GradientAggregator:
         if not decompressed:
             return None, {"status": "no_valid_gradients"}
         
-        # FedAvg: weighted average by sample count
+        # FedAvg: weighted average by sample count, reputation-normalized
         total_samples = sum(s for _, s, _ in decompressed)
         
         # Initialize aggregated with zero tensors
@@ -246,24 +246,24 @@ class GradientAggregator:
             elif isinstance(val, torch.Tensor):
                 aggregated[key] = torch.zeros_like(val, dtype=torch.float32)
         
+        # Compute total weight (sample count * reputation factor)
+        total_weight = 0.0
+        for client_id, num_samples, _ in decompressed:
+            rep = reputations.get(client_id, 50.0) / 50.0  # Normalize to 0.5-1.5
+            total_weight += num_samples * rep
+        
         # Weighted sum
         for client_id, num_samples, state_dict in decompressed:
-            weight = num_samples / total_samples
             rep = reputations.get(client_id, 50.0) / 50.0  # Normalize to 0.5-1.5
+            weight = (num_samples * rep) / total_weight  # Single normalized weight
             
             for key in aggregated:
                 if key in state_dict:
                     val = state_dict[key]
                     if isinstance(val, torch.Tensor):
-                        aggregated[key] = aggregated[key] + val.float() * weight * rep
+                        aggregated[key] = aggregated[key] + val.float() * weight
                     elif isinstance(val, np.ndarray):
-                        aggregated[key] = aggregated[key] + val * weight * rep
-        
-        # Normalize by total reputation weight
-        total_rep = sum(reputations.get(c, 50) for c, _, _ in decompressed)
-        for key in aggregated:
-            if isinstance(aggregated[key], torch.Tensor):
-                aggregated[key] = aggregated[key] / (total_rep / 50.0)
+                        aggregated[key] = aggregated[key] + val * weight
         
         # Serialize
         serialized = pickle.dumps(aggregated)
@@ -303,6 +303,9 @@ class FederatedServer:
         
         self.current_model: Optional[bytes] = None
         self.global_round: int = 0
+        self.compression_method = self.config.get("compression_method", "none")
+        self.compression_k = self.config.get("compression_k", 0.1)
+        self.compression_bits = self.config.get("compression_bits", 8)
         
         self._lock = threading.RLock()
         
@@ -589,24 +592,37 @@ class FederatedServer:
 class FederatedSocketHandler(socketserver.BaseRequestHandler):
     """
     Handle one client connection via raw sockets.
-    
+
     Protocol (matching fed_client.py):
       1. Client sends JSON metadata: {"type": "gradients", "client_id": "...", "round": N}
       2. Server reads N tensor frames: [name_len(4)][name_bytes][size(4)][data]
       3. Server aggregates gradients (FedAvg)
       4. Server sends JSON: {"type": "update", "n_tensors": K, "round": R}
       5. Server sends K tensor frames back
+
+    Disconnect handling:
+      - Socket timeout (30s) prevents hanging on slow clients
+      - ConnectionResetError/BrokenPipeError/OSError caught at top level
+      - Disconnected clients are marked so their gradients are excluded
+      - Round continues with remaining clients
     """
+
+    # Socket timeout for recv operations (seconds) — prevents hanging forever
+    SOCKET_TIMEOUT = 30
 
     def handle(self):
         server = self.server.server_instance
         lock = server._get_lock()
         client_ip = self.client_address[0] if self.client_address else "unknown"
+        client_id = "unknown"
+        round_num = 0
+
+        # Set socket timeout so recv calls don't block forever
+        self.request.settimeout(self.SOCKET_TIMEOUT)
 
         try:
             # --- Auth token exchange (if server has auth_token configured) ---
             if self.server.auth_token is not None:
-                # Client sends 4-byte token length followed by token bytes
                 token_header = self._recv_exact(4)
                 if not token_header or len(token_header) < 4:
                     logger.warning(f"[{client_ip}] Auth failed: connection closed during token read")
@@ -621,18 +637,17 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
                     return
                 received_token = token_bytes.decode("utf-8", errors="replace")
                 if not secrets.compare_digest(received_token, self.server.auth_token):
-                    # Use constant-time comparison to avoid timing attacks
                     logger.warning(f"[{client_ip}] Auth failed: invalid auth token")
                     return
                 logger.info(f"[{client_ip}] Client authenticated successfully")
 
             # --- Step 1: receive JSON metadata ---
             header = self._recv_exact(4)
-            if not header:
+            if not header or len(header) < 4:
                 return
             meta_len = struct.unpack("!I", header)[0]
             meta_bytes = self._recv_exact(meta_len)
-            if not meta_bytes:
+            if not meta_bytes or len(meta_bytes) < meta_len:
                 return
             meta = json.loads(meta_bytes.decode("utf-8"))
             msg_type = meta.get("type", "")
@@ -645,20 +660,47 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
                 self._handle_gradients(server, lock, client_id, round_num)
             elif msg_type == "disconnect":
                 logger.info(f"[{client_id}] Client disconnected gracefully")
+                with lock:
+                    if round_num in server.round_state:
+                        rs = server.round_state[round_num]
+                        rs.clients_completed.append(client_id)
             else:
                 logger.warning(f"[{client_id}] Unknown message type: {msg_type}")
 
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            # Client disconnected mid-round — mark as disconnected, don't crash
+            logger.warning(f"[{client_id}] Client disconnected (round {round_num}): {e}")
+            self._mark_client_disconnected(server, lock, client_id, round_num)
         except Exception as e:
             logger.error(f"[{client_id}] Socket handler error: {e}")
+            self._mark_client_disconnected(server, lock, client_id, round_num)
+
+    def _mark_client_disconnected(self, server, lock, client_id: str, round_num: int):
+        """Mark a client as disconnected mid-round so their gradient is excluded from aggregation."""
+        if round_num <= 0 or client_id == "unknown":
+            return
+        with lock:
+            if round_num in server.round_state:
+                rs = server.round_state[round_num]
+                if client_id not in rs.clients_disconnected:
+                    rs.clients_disconnected.append(client_id)
+                    logger.info(f"[{client_id}] disconnected mid-round, skipping")
 
     def _recv_exact(self, n: int) -> bytes:
-        """Receive exactly n bytes."""
+        """Receive exactly n bytes. Returns partial data on timeout/disconnect."""
         data = b""
         while len(data) < n:
-            chunk = self.request.recv(n - len(data))
-            if not chunk:
+            try:
+                chunk = self.request.recv(n - len(data))
+                if not chunk:
+                    return data
+                data += chunk
+            except socket.timeout:
+                # Timed out waiting for data — return what we have
                 return data
-            data += chunk
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                # Client disconnected — return what we have
+                return data
         return data
 
     def _recv_tensor(self) -> Tuple[str, torch.Tensor]:
@@ -689,17 +731,31 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
     def _handle_gradients(self, server, lock, client_id: str, round_num: int):
         """Receive gradients, aggregate, send update back."""
         # --- Step 2: receive pickle-serialized gradient dict ---
-        n_header = self._recv_exact(4)
-        if len(n_header) < 4:
+        try:
+            n_header = self._recv_exact(4)
+            if len(n_header) < 4:
+                self._mark_client_disconnected(server, lock, client_id, round_num)
+                return
+            n_bytes = struct.unpack("!I", n_header)[0]
+            raw = b""
+            while len(raw) < n_bytes:
+                chunk = self.request.recv(min(65536, n_bytes - len(raw)))
+                if not chunk:
+                    break
+                raw += chunk
+            if not raw or len(raw) < n_bytes:
+                self._mark_client_disconnected(server, lock, client_id, round_num)
+                return
+            grad_state = pickle.loads(raw)
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            logger.warning(f"[{client_id}] Disconnected while receiving gradients: {e}")
+            self._mark_client_disconnected(server, lock, client_id, round_num)
             return
-        n_bytes = struct.unpack("!I", n_header)[0]
-        raw = b""
-        while len(raw) < n_bytes:
-            chunk = self.request.recv(min(65536, n_bytes - len(raw)))
-            if not chunk:
-                break
-            raw += chunk
-        grad_state = pickle.loads(raw)
+        except Exception as e:
+            logger.error(f"[{client_id}] Error receiving gradients: {e}")
+            self._mark_client_disconnected(server, lock, client_id, round_num)
+            return
+
         logger.info(f"[{client_id}] Received {len(grad_state)} gradient tensors (pickle)")
 
         # Register client
@@ -733,7 +789,8 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
             rs = server.round_state[round_num]
             rs.gradients_received += 1
             rs.gradients_accepted += 1
-            rs.clients_joined.append(client_id)
+            if client_id not in rs.clients_joined:
+                rs.clients_joined.append(client_id)
             server.metrics.total_gradients_received += 1
 
             if client_id in server.clients:
@@ -747,38 +804,69 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
             # Check if we should aggregate
             min_clients = server.config.get("min_clients_per_round", 2)
             if len(set(rs.clients_joined)) >= min_clients and rs.status == "collecting":
-                self._aggregate_and_respond(server, lock, round_num)
+                self._aggregate_and_respond(server, lock, round_num, client_id)
             else:
                 # Not enough clients yet — wait briefly then respond
                 time.sleep(0.5)
-                self._aggregate_and_respond(server, lock, round_num)
+                self._aggregate_and_respond(server, lock, round_num, client_id)
 
-    def _aggregate_and_respond(self, server, lock, round_num: int):
+    def _aggregate_and_respond(self, server, lock, round_num: int, completed_client_id: str = None):
         """Aggregate gradients and send model update back to this client."""
         rs = server.round_state.get(round_num)
         if rs is None:
             return
 
-        # Wait for status to settle
-        timeout = 10
+        # Wait for status to settle using configurable round timeout
+        round_wait = server.config.get("round_wait_secs", 60)
         waited = 0
-        while rs.status == "collecting" and waited < timeout:
-            time.sleep(0.1)
-            waited += 0.1
+        while rs.status == "collecting" and waited < round_wait:
+            time.sleep(0.5)
+            waited += 0.5
 
-        # If still collecting (only 1 client), force aggregation
-        if rs.status == "collecting":
-            logger.info(f"Force-aggregating round {round_num} with {len(set(rs.clients_joined))} client(s)")
-            updates = []
-            for cid in set(rs.clients_joined):
-                if cid in server.clients and server.clients[cid].pending_gradient:
-                    updates.append(server.clients[cid].pending_gradient)
-            if updates:
-                reputations = {c.client_id: c.reputation for c in server.clients.values()}
-                aggregated, stats = server.aggregator.aggregate(updates, reputations)
-                if aggregated:
-                    server._apply_gradient(aggregated)
-                    server._save_model(round_num)
+        with lock:
+            # Exclude disconnected clients from aggregation
+            active_joined = [
+                cid for cid in rs.clients_joined
+                if cid not in rs.clients_disconnected
+            ]
+            total_joined = len(set(rs.clients_joined))
+            disconnected = list(set(rs.clients_joined) - set(active_joined))
+
+            if rs.status == "collecting":
+                # Timeout reached or enough clients — aggregate with whoever we have
+                disconnected_names = ", ".join(disconnected) if disconnected else "none"
+                if len(active_joined) < total_joined:
+                    logger.warning(
+                        f"Round {round_num}: timeout with {len(active_joined)}/{total_joined} "
+                        f"active clients ({disconnected_names} disconnected)"
+                    )
+                elif len(active_joined) < server.config.get("min_clients_per_round", 2):
+                    min_req = server.config.get("min_clients_per_round", 2)
+                    logger.warning(
+                        f"Round {round_num}: fewer clients ({len(active_joined)}) than "
+                        f"min_clients ({min_req}) — proceeding anyway"
+                    )
+
+                updates = []
+                for cid in active_joined:
+                    if cid in server.clients and server.clients[cid].pending_gradient:
+                        updates.append(server.clients[cid].pending_gradient)
+                if updates:
+                    reputations = {c.client_id: c.reputation for c in server.clients.values()}
+                    aggregated, stats = server.aggregator.aggregate(updates, reputations)
+                    if aggregated:
+                        server._apply_gradient(aggregated)
+                        server._save_model(round_num)
+                    # Log round summary
+                    contrib_names = ", ".join(updates[u].get("client_id", "?") for u in range(len(updates)))
+                    disc_names = ", ".join(disconnected) if disconnected else ""
+                    logger.info(
+                        f"Round {round_num}: {len(updates)}/{total_joined} clients contributed "
+                        f"({disc_names} disconnected) — aggregated"
+                    )
+                else:
+                    aggregated = None
+                    logger.warning(f"Round {round_num}: no valid gradients to aggregate")
                 rs.status = "done"
                 rs.completed_at = time.time()
                 rs.aggregated_gradient = aggregated
@@ -787,33 +875,67 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
                 server.global_round = round_num
                 server.metrics.total_rounds += 1
 
+            # Mark this client as completed
+            if completed_client_id and completed_client_id not in rs.clients_completed:
+                rs.clients_completed.append(completed_client_id)
+
         # Build model update response
+        # Use server config; compression sub-agent may override these on the handler
+        compression_method = getattr(self, "compression_method", None) or server.config.get("compression_method", "none")
+        compression_k = getattr(self, "compression_k", 0.1)
+        compression_bits = getattr(self, "compression_bits", 8)
         if server.current_model:
             state = pickle.loads(server.current_model)
-            # Send full state dict (shapes preserved through pickle round-trip)
             update_tensors = state
         elif rs.aggregated_gradient:
-            # Aggregated gradients from this round
             update_tensors = pickle.loads(rs.aggregated_gradient)
         else:
             update_tensors = {}
 
         logger.info(f"[{self.client_address}] Sending {len(update_tensors)} tensors as model update")
 
+        # Apply compression if configured
+        compression_metadata = {"method": "none"}
+        if compression_method != "none":
+            from federated.compression import compress_gradients
+            try:
+                compressed_update, compression_metadata = compress_gradients(
+                    update_tensors, method=compression_method, k=compression_k, bits=compression_bits
+                )
+                response_data = pickle.dumps(compressed_update)
+                orig_size = sum(t.numel() * 4 for t in update_tensors.values() if isinstance(t, torch.Tensor))
+                comp_size = len(response_data)
+                ratio = orig_size / max(comp_size, 1)
+                logger.info(
+                    f"[{self.client_address}] Compression applied: "
+                    f"method={compression_method}, "
+                    f"original={orig_size/1024:.1f}KB, "
+                    f"compressed={comp_size/1024:.1f}KB, "
+                    f"ratio={ratio:.1f}x"
+                )
+                update_tensors = None  # Signal that we're sending compressed data
+            except Exception as e:
+                logger.warning(f"Compression failed ({e}), sending uncompressed")
+                compression_metadata = {"method": "none"}
+                response_data = pickle.dumps(update_tensors)
+        else:
+            response_data = pickle.dumps(update_tensors)
+
         # --- Step 4: send JSON metadata ---
         response_meta = {
             "type": "update",
-            "n_tensors": len(update_tensors),
+            "n_tensors": len(update_tensors) if update_tensors is not None else -1,
             "round": round_num,
+            "compression": compression_metadata,
         }
         response_bytes = json.dumps(response_meta).encode("utf-8")
-        self.request.sendall(struct.pack("!I", len(response_bytes)) + response_bytes)
-
-        # --- Step 5: send pickle-serialized state dict (preserves shapes) ---
-        response_data = pickle.dumps(update_tensors)
-        self.request.sendall(struct.pack("!I", len(response_data)) + response_data)
-
-        logger.info(f"[{self.client_address}] Update sent for round {round_num}")
+        try:
+            self.request.sendall(struct.pack("!I", len(response_bytes)) + response_bytes)
+            # --- Step 5: send payload (compressed or pickle-serialized) ---
+            self.request.sendall(struct.pack("!I", len(response_data)) + response_data)
+            logger.info(f"[{self.client_address}] Update sent for round {round_num}")
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            logger.warning(f"[{self.client_address}] Client disconnected before receiving update: {e}")
 
 
 class FederatedSocketServer(socketserver.ThreadingTCPServer):
@@ -1004,6 +1126,13 @@ def main():
                         help="Shared secret token for client authentication (optional)")
     parser.add_argument("--round-timeout", type=int, default=60,
                         help="Max seconds to wait for clients per round (default 60)")
+    parser.add_argument("--compression", choices=["none", "sparsify", "quantize", "both"],
+                        default="none",
+                        help="Gradient compression method for sending updates to clients")
+    parser.add_argument("--compression-k", type=float, default=0.1,
+                        help="Sparsification ratio K (fraction to keep, e.g. 0.1 = keep top 10%%)")
+    parser.add_argument("--compression-bits", type=int, default=8,
+                        help="Quantization bits (8 or 16)")
     parser.add_argument("--gen-token", action="store_true",
                         help="Generate a random auth token and exit")
 
@@ -1020,6 +1149,9 @@ def main():
     config["min_clients_per_round"] = args.min_clients
     config["round_wait_secs"] = args.round_timeout
     config["auth_token"] = args.auth_token
+    config["compression_method"] = args.compression
+    config["compression_k"] = args.compression_k
+    config["compression_bits"] = args.compression_bits
 
     if args.mode == "server":
         if not FASTAPI_AVAILABLE:

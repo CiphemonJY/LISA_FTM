@@ -94,40 +94,85 @@ class FederatedClient:
         self.sock.sendall(struct.pack("!I", len(data)) + data)
 
     def recv_model_update(self) -> dict:
-        """Receive aggregated model update from server (pickle-serialized dict)."""
-        grads = {}
-        # Receive JSON header + body
-        header = self.sock.recv(4)
-        if len(header) < 4:
-            log.warning("No response header from server")
-            return grads
-        meta_len = struct.unpack("!I", header)[0]
-        meta_bytes = b""
-        while len(meta_bytes) < meta_len:
-            chunk = self.sock.recv(meta_len - len(meta_bytes))
-            if not chunk:
-                break
-            meta_bytes += chunk
-        try:
-            meta = json.loads(meta_bytes.decode("utf-8"))
-            log.info(f"  Server response: {meta}")
-        except Exception as e:
-            log.warning(f"Failed to parse server response JSON: {e}")
-            return grads
+        """Receive aggregated model update from server (pickle-serialized dict).
 
-        # Receive pickle data
-        n_header = self.sock.recv(4)
-        if len(n_header) < 4:
+        Handles compressed payloads if the server sends compression metadata.
+        On socket timeout, returns empty dict (callers can reconnect).
+        """
+        grads = {}
+        try:
+            # Receive JSON header + body
+            header = self.sock.recv(4)
+            if len(header) < 4:
+                log.warning("No response header from server")
+                return grads
+            meta_len = struct.unpack("!I", header)[0]
+            meta_bytes = b""
+            while len(meta_bytes) < meta_len:
+                chunk = self.sock.recv(meta_len - len(meta_bytes))
+                if not chunk:
+                    break
+                meta_bytes += chunk
+            try:
+                meta = json.loads(meta_bytes.decode("utf-8"))
+                log.info(f"  Server response: {meta}")
+            except Exception as e:
+                log.warning(f"Failed to parse server response JSON: {e}")
+                return grads
+
+            # Check for error / round-failed response
+            msg_type = meta.get("type", "")
+            if msg_type == "error" or msg_type == "round_failed":
+                log.warning(f"Server reported round failure: {meta.get('message', 'unknown')}")
+                return grads
+
+            compression_meta = meta.get("compression", {})
+            compression_method = compression_meta.get("method", "none")
+
+            # Receive pickle data
+            n_header = self.sock.recv(4)
+            if len(n_header) < 4:
+                return grads
+            n_bytes = struct.unpack("!I", n_header)[0]
+            raw = b""
+            while len(raw) < n_bytes:
+                chunk = self.sock.recv(min(65536, n_bytes - len(raw)))
+                if not chunk:
+                    break
+                raw += chunk
+
+            if not raw:
+                return grads
+
+            # Decompress if needed
+            if compression_method != "none":
+                from federated.compression import decompress_gradients
+                try:
+                    grads = decompress_gradients(raw, compression_meta)
+                    log.info(f"  Decompressed {len(grads)} tensors")
+                except Exception as e:
+                    log.warning(f"Decompression failed ({e}), treating as raw pickle")
+                    grads = pickle.loads(raw)
+            else:
+                grads = pickle.loads(raw)
+        except socket.timeout:
+            log.warning("Timeout waiting for model update from server")
             return grads
-        n_bytes = struct.unpack("!I", n_header)[0]
-        raw = b""
-        while len(raw) < n_bytes:
-            chunk = self.sock.recv(min(65536, n_bytes - len(raw)))
-            if not chunk:
-                break
-            raw += chunk
-        if raw:
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            log.warning(f"Server disconnected while sending update: {e}")
+            return grads
+        return grads
+            try:
+                from federated.compression import decompress_gradients
+                compressed = pickle.loads(raw)
+                grads = decompress_gradients(compressed, compression_meta)
+                log.info(f"  Decompressed {len(grads)} tensors (method={compression_method})")
+            except Exception as e:
+                log.warning(f"Decompression failed ({e}), treating as uncompressed pickle")
+                grads = pickle.loads(raw)
+        else:
             grads = pickle.loads(raw)
+
         return grads
 
     def load_model(self) -> bool:
@@ -249,7 +294,11 @@ class FederatedClient:
         log.info(f"  Applied {len(updates)} gradient updates (accumulated)")
 
     def run_federated_round(self, data: list = None) -> bool:
-        """One round: train locally, send gradients, receive update."""
+        """One round: train locally, send gradients, receive update.
+
+        On socket timeout receiving the update, tries to reconnect up to 3 times
+        before saving gradients locally as fallback.
+        """
         log.info(f"\n=== Federated Round {self.round_num} ===")
 
         # Train locally
@@ -275,21 +324,54 @@ class FederatedClient:
             # Send gradients
             self.send_gradients(grads)
 
-            # Receive aggregated update
+            # Receive aggregated update (with timeout-based reconnection)
             log.info("Waiting for model update from server...")
-            updates = self.recv_model_update()
+            max_retries = 3
+            updates = {}
+            for attempt in range(1, max_retries + 1):
+                updates = self.recv_model_update()
+                if updates:
+                    break
+                if attempt < max_retries:
+                    log.warning(
+                        f"Timeout/disconnect receiving update — attempt {attempt}/{max_retries}, "
+                        f"reconnecting..."
+                    )
+                    self.sock.close()
+                    self.sock = None
+                    if self.connect():
+                        # Resend gradients on fresh connection
+                        self.send_gradients(grads)
+                    else:
+                        log.warning("Reconnect failed")
+                        break
+            else:
+                log.warning(
+                    f"Failed to receive update after {max_retries} attempts — "
+                    f"saving gradients locally"
+                )
+
             if updates:
                 self.apply_gradients(updates)
                 log.info("  Round complete - model updated")
             else:
-                log.info("  No updates received from server")
+                log.info("  No updates received from server — saving locally as fallback")
+                out_dir = Path("output/federated_grads")
+                out_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(grads, out_dir / f"round_{self.round_num}_grads.pt")
 
             self.round_num += 1
             return True
 
-        except Exception as e:
-            log.warning(f"Server communication error: {e}")
-            # Save locally as fallback
+        except socket.timeout:
+            log.warning(f"Socket timeout in round {self.round_num} — saving gradients locally")
+            out_dir = Path("output/federated_grads")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(grads, out_dir / f"round_{self.round_num}_grads.pt")
+            self.round_num += 1
+            return True
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            log.warning(f"Server disconnected during round {self.round_num}: {e}")
             out_dir = Path("output/federated_grads")
             out_dir.mkdir(parents=True, exist_ok=True)
             torch.save(grads, out_dir / f"round_{self.round_num}_grads.pt")
