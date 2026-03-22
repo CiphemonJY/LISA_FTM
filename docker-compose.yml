@@ -1,58 +1,34 @@
-# Docker Compose for LISA+Offload
-# One-command deployment with all dependencies
-
 version: '3.8'
-
 services:
-  lisa-api:
+  server:
     build: .
-    image: lisa-offload:latest
-    container_name: lisa-offload-api
     ports:
-      - "8000:8000"
+      - "8080:8080"
+    command: python -m federated.server --model EleutherAI/pythia-70m --rounds 3 --port 8080
     volumes:
-      - ./models:/app/models
-      - ./data:/app/data
       - ./output:/app/output
-    environment:
-      - PYTHONUNBUFFERED=1
-      - OMP_NUM_THREADS=1
-      - KMP_DUPLICATE_LIB_OK=TRUE
-      - MAX_MEMORY_GB=6.0
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
+      - ./config:/app/config
 
-  # Optional: Model downloader service
-  model-downloader:
-    image: python:3.11-slim
-    container_name: lisa-model-downloader
+  client-1:
+    build: .
+    depends_on:
+      - server
+    command: python fed_client.py --server server --port 8080 --client-id client-1
     volumes:
-      - ./models:/models
-    command: >
-      bash -c "
-        pip install huggingface_hub &&
-        python -c \"from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-7B-Instruct', local_dir='/models/Qwen2.5-7B-Instruct')\"
-      "
-    profiles:
-      - download
+      - ./output:/app/output
 
-  # Optional: Training monitor
-  monitor:
-    image: grafana/grafana:latest
-    container_name: lisa-monitor
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+  client-2:
+    build: .
+    depends_on:
+      - server
+    command: python fed_client.py --server server --port 8080 --client-id client-2
     volumes:
-      - grafana-storage:/var/lib/grafana
-    profiles:
-      - monitor
+      - ./output:/app/output
 
-volumes:
-  grafana-storage:
+  client-3:
+    build: .
+    depends_on:
+      - server
+    command: python fed_client.py --server server --port 8080 --client-id client-3
+    volumes:
+      - ./output:/app/output
