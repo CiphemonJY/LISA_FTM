@@ -889,7 +889,7 @@ def cmd_suggest():
     for p in sorted(pareto, key=lambda x: x["final_perplexity"]):
         cfg = p["config"]
         logger.info(f"    exp={p['exp_id']} ppl={p['final_perplexity']:.2f} comm={p['total_comm_cost']} "
-                    f"→ LISA({cfg['LISA_BOTTOM_LAYERS']}+{cfg['LISA_MIDDLE_SAMPLE']}+{cfg['LISA_TOP_LAYERS']) "
+                    f" LISA({cfg['LISA_BOTTOM_LAYERS']}+{cfg['LISA_MIDDLE_SAMPLE']}+{cfg['LISA_TOP_LAYERS']})"
                     f"LR={cfg['LR']} COMPRESSION={cfg['COMPRESSION']}")
 
     logger.info("\n[TOP SUGGESTIONS]:")

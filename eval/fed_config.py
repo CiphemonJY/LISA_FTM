@@ -8,7 +8,7 @@
 # LISA layer selection params
 LISA_BOTTOM_LAYERS = 2
 LISA_TOP_LAYERS = 2
-LISA_MIDDLE_SAMPLE = 2
+LISA_MIDDLE_SAMPLE = 0
 
 # Training params
 LR = 3e-4
