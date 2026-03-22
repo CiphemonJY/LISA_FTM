@@ -420,3 +420,9 @@ def run_standalone():
 
 if __name__ == "__main__":
     run_standalone()
+
+
+def main():
+    """Entry point for lisa-client CLI."""
+    run_standalone()
+
