@@ -30,7 +30,7 @@ import hashlib
 import json
 import os
 import struct
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -71,7 +71,7 @@ class AuditEvent:
         epoch: Optional[str] = None,
         extra: Optional[Dict[str, Any]] = None,
     ):
-        self.timestamp = datetime.utcnow().isoformat() + "Z"
+        self.timestamp = datetime.now(timezone.utc).isoformat() + "Z"
         self.event_type = event_type
         self.client_id = client_id
         self.user_id = user_id
@@ -207,7 +207,7 @@ class AuditLogger:
 
     def _write_event(self, event: Dict[str, Any]) -> None:
         """Append an encrypted, JSON-serialized event to the daily log file."""
-        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         log_file = self.audit_dir / f"audit_{date_str}.log"
         encrypted = self.fernet.encrypt(json.dumps(event, default=str).encode("utf-8"))
         with open(log_file, "ab") as f:
@@ -318,7 +318,7 @@ class AuditLogger:
             end_date: YYYY-MM-DD or None (today).
         """
         if end_date is None:
-            end_date = datetime.utcnow().strftime("%Y-%m-%d")
+            end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         all_files = sorted(
             [f for f in self.audit_dir.glob("audit_*.log") if f.name != ".chain_state"]
@@ -417,10 +417,10 @@ class AuditLogger:
         - retention_info (confirms 7-year policy)
         """
         if end_date is None:
-            end_date = datetime.utcnow().strftime("%Y-%m-%d")
+            end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if start_date is None:
             # Default: last 90 days
-            start_dt = datetime.utcnow() - timedelta(days=90)
+            start_dt = datetime.now(timezone.utc) - timedelta(days=90)
             start_date = start_dt.strftime("%Y-%m-%d")
 
         all_events: List[Dict[str, Any]] = []
@@ -459,7 +459,7 @@ class AuditLogger:
         chain_result = self.verify_all_chains(start_date, end_date)
 
         report = {
-            "report_generated_at": datetime.utcnow().isoformat() + "Z",
+            "report_generated_at": datetime.now(timezone.utc).isoformat() + "Z",
             "hipaa_version": "HIPAA Privacy Rule 164.312(b)",
             "chain_verification": chain_result,
             "date_range": {"start": start_date, "end": end_date},
