@@ -124,6 +124,25 @@ Hospital C (Oracle)    ─┘       (your Mac Mini)
 
 ## Go-to-Market Path
 
+### Track A: Research Collaboration (fastest path)
+Works best with MD/PhD clinical champion at a hospital or university.
+
+| Phase | Timeline | Milestone |
+|-------|---------|-----------|
+| **Phase 0** | Week 1 | Meet with family MD/PhD — pitch problem, not tech |
+| **Phase 1** | Week 2–4 | Submit IRB application with clinical champion as PI |
+| **Phase 2** | Month 2–3 | IRB approved → pilot on de-identified retrospective cohort |
+| **Phase 3** | Month 4–6 | Pilot complete → joint publication |
+| **Phase 4** | Month 6–12 | Publication → expand to 2–3 hospital network |
+
+**Why this works:** Research collaborations don't require procurement approval. IRB review is faster than SaaS contracts. Joint paper = hospital marketing wins. No budget fight.
+
+**What the hospital provides:** IRB approval, de-identified dataset, MD/PhD clinical champion as named PI
+**What you provide:** LISA_FTM platform, technical development, first authorship if you build the system
+
+### Track B: Direct Sales (slower, higher revenue)
+Traditional vendor relationship with paid pilot.
+
 | Phase | Timeline | Milestone |
 |-------|---------|-----------|
 | **Phase 0** | Week 1–2 | Stand up 3-client FL demo with MIMIC-III sample data |
@@ -132,6 +151,25 @@ Hospital C (Oracle)    ─┘       (your Mac Mini)
 | **Phase 3** | Month 3–6 | Convert pilot to $5K–$15K/month subscription |
 | **Phase 4** | Month 6–12 | Land 2–3 paying health systems |
 | **Phase 5** | Year 2 | Pharma licensing deals |
+
+---
+
+## Family MD/PhD Collaboration (current opportunity)
+
+**Potential clinical champions:**
+- [Your dad / brother — specialty TBD]
+- Can provide: institutional access, IRB sponsorship, patient cohort, clinical domain expertise
+
+**Proposed arrangement:**
+- Joint paper authorship (you = first author for technical contribution, they = last author for clinical contribution)
+- Clinical champion listed as PI on IRB application
+- All IP outside of their institutional contribution remains yours
+- No equity or cash required for the pilot phase — mutual publication + institutional credit is sufficient incentive for both sides
+
+**This approach requires only:**
+- HIPAA BAA (~$1–2K legal review)
+- IRB application (your family member handles the submission)
+- De-identified dataset (hospital provides, you never see raw data)
 
 ---
 
