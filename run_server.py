@@ -21,10 +21,16 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Configure logging
+# Configure logging — UTF-8 file handler for /tmp/server.log + UTF-8 stdout
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+_log_handler.setEncoding("utf-8")
+_log_file_handler = logging.FileHandler("/tmp/server.log", encoding="utf-8", mode="a")
+_log_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[_log_handler, _log_file_handler],
 )
 logger = logging.getLogger("fed-server")
 

@@ -49,13 +49,18 @@ try:
     FASTAPI_AVAILABLE = True
 except ImportError:
     FASTAPI_AVAILABLE = False
-    print("Warning: fastapi not installed. HTTP API disabled. Use --demo mode.")
+    logger.warning("fastapi not installed. HTTP API disabled. Use --demo mode.")
 
-# Configure logging
+# Configure logging — UTF-8 file handler for /tmp/server.log + UTF-8 stdout
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
+_log_handler.setEncoding("utf-8")
+_log_file_handler = logging.FileHandler("/tmp/server.log", encoding="utf-8", mode="a")
+_log_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[_log_handler, _log_file_handler],
 )
 logger = logging.getLogger("fed-server")
 
@@ -439,16 +444,12 @@ class FederatedServer:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
             config = AutoConfig.from_pretrained(model_name)
-            config.hidden_size = min(config.hidden_size, 512)
-            config.num_attention_heads = min(config.num_attention_heads, 8)
-            config.num_hidden_layers = min(config.num_hidden_layers, 6)
 
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 config=config,
                 trust_remote_code=True,
                 torch_dtype=torch.float32,
-                ignore_mismatched_sizes=True,
             )
 
             # Try to resume from the latest checkpoint
@@ -1667,7 +1668,7 @@ def main():
 
     if args.mode == "server":
         if not FASTAPI_AVAILABLE:
-            print("Error: fastapi not installed. Install with: pip install fastapi uvicorn")
+            logger.error("fastapi not installed. Install with: pip install fastapi uvicorn")
             sys.exit(1)
 
         server = FederatedServer(config)

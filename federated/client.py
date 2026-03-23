@@ -390,18 +390,14 @@ class LocalTrainer:
                 if self.tokenizer.pad_token is None:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
                 
-                # Load model with memory-friendly settings
+                # Load model
                 config = AutoConfig.from_pretrained(name, trust_remote_code=True)
-                config.hidden_size = min(config.hidden_size, 512)  # Cap hidden size
-                config.num_attention_heads = min(config.num_attention_heads, 8)
-                config.num_hidden_layers = min(config.num_hidden_layers, 6)
                 
                 self.model = AutoModelForCausalLM.from_pretrained(
                     name,
                     config=config,
                     trust_remote_code=True,
                     torch_dtype=torch.float32,
-                    ignore_mismatched_sizes=True,
                 )
                 
                 # Freeze most layers for CPU efficiency (LISA-style)

@@ -101,13 +101,13 @@ def main():
         train_time = time.time() - train_start
 
         # Check result
-        if isinstance(update, dict) and update.get("status") == "error":
+        if hasattr(update, "get") and update.get("status") == "error":
             logger.warning(f"  Submission failed: {update.get('message')}")
             # Server might not be running - just continue
         else:
             logger.info(f"  Training time: {train_time:.1f}s")
             logger.info(f"  Gradient submitted successfully")
-            logger.info(f"  Server response: {update}")
+            logger.info(f"  Server response: {update.to_dict() if hasattr(update, 'to_dict') else update}")
 
         # Check round status
         try:
