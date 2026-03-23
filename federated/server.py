@@ -54,7 +54,8 @@ except ImportError:
 # Configure logging — UTF-8 file handler for /tmp/server.log + UTF-8 stdout
 _log_handler = logging.StreamHandler(sys.stdout)
 _log_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
-_log_handler.setEncoding("utf-8")
+if hasattr(_log_handler, "setEncoding"):
+    _log_handler.setEncoding("utf-8")
 _log_file_handler = logging.FileHandler("/tmp/server.log", encoding="utf-8", mode="a")
 _log_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
 logging.basicConfig(
