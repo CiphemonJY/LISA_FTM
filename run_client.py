@@ -101,7 +101,7 @@ def main():
         train_time = time.time() - train_start
 
         # Check result
-        if update.get("status") == "error":
+        if isinstance(update, dict) and update.get("status") == "error":
             logger.warning(f"  Submission failed: {update.get('message')}")
             # Server might not be running - just continue
         else:

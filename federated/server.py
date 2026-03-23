@@ -651,6 +651,14 @@ class FederatedServer:
             epoch=str(round_num),
         )
 
+        # Compute round time before completing
+        completed_at = time.time()
+        round_time = completed_at - rs.started_at
+        self.metrics.avg_round_time = (
+            (self.metrics.avg_round_time * (self.metrics.total_rounds - 1) + round_time)
+            / self.metrics.total_rounds
+        )
+
         # Save versioned checkpoint with metadata
         try:
             metrics = {
@@ -668,7 +676,6 @@ class FederatedServer:
 
         # Complete round
         rs.status = "done"
-        rs.completed_at = time.time()
         rs.aggregated_gradient = aggregated
 
         # Clear pending gradients
@@ -678,12 +685,6 @@ class FederatedServer:
         # Update metrics
         self.global_round = round_num
         self.metrics.total_rounds += 1
-
-        round_time = rs.completed_at - rs.started_at
-        self.metrics.avg_round_time = (
-            (self.metrics.avg_round_time * (self.metrics.total_rounds - 1) + round_time)
-            / self.metrics.total_rounds
-        )
 
         # Memory profiling
         try:
