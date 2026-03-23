@@ -1674,28 +1674,28 @@ def main():
         server = FederatedServer(config)
         app._server = server  # type: ignore
 
-        print(f"Starting HTTP server on {args.host}:{args.port}")
+        logger.info(f"Starting HTTP server on {args.host}:{args.port}")
         uvicorn.run(app, host=args.host, port=args.port)
 
     elif args.mode == "socket":
         # Socket-based server for fed_client.py
-        print(f"Loading model: {args.model} ...")
+        logger.info(f"Loading model: {args.model} ...")
         server = FederatedServer(config)
 
-        print(f"Starting socket server on {args.host}:{args.port}")
+        logger.info(f"Starting socket server on {args.host}:{args.port}")
         socket_server = FederatedSocketServer(server, port=args.port, auth_token=args.auth_token)
 
-        print(f"Federated socket server running on port {args.port}")
-        print(f"  Model: {args.model}")
-        print(f"  Rounds: {args.rounds}")
-        print(f"  Min clients/round: {args.min_clients}")
-        print(f"  Waiting for clients...")
-        print(f"Press Ctrl+C to stop.")
+        logger.info(f"Federated socket server running on port {args.port}")
+        logger.info(f"  Model: {args.model}")
+        logger.info(f"  Rounds: {args.rounds}")
+        logger.info(f"  Min clients/round: {args.min_clients}")
+        logger.info("  Waiting for clients...")
+        logger.info("  Press Ctrl+C to stop.")
 
         try:
             socket_server.serve_forever()
         except KeyboardInterrupt:
-            print("\nShutting down...")
+            logger.info("Shutting down...")
             socket_server.shutdown()
 
     else:
@@ -1711,8 +1711,8 @@ def main():
         # Run simulation
         results = sim.run(args.rounds)
 
-        print("\n=== RESULTS ===")
-        print(json.dumps(results["final_status"], indent=2))
+        logger.info("=== RESULTS ===")
+        logger.info(json.dumps(results["final_status"], indent=2))
 
 
 if __name__ == "__main__":
