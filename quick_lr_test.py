@@ -227,7 +227,7 @@ def run_one_round(srv_lr):
             l.lora_B.data.add_(acc[f"{k}.B"], alpha=SERVER_LR)
 
     ppl_after = ppl(model, test_enc, tok)
-    return ppl_before, ppl_after, avg_norm, max_norm, SERVER_LR
+    return ppl_before, ppl_after, avg_norm, max_norm
 
 
 print(f"\n--- Testing SERVER_LR (1 round, {NUM_CLIENTS} clients, {TRAIN_BATCHES} batches each) ---")
