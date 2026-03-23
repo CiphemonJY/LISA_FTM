@@ -1376,7 +1376,10 @@ def test_audit_logger_compliance_report():
 
 def test_pyproject_toml_packages_includes_federated_lisa_utils():
     """Verify pyproject.toml [tool.setuptools] packages covers key modules."""
-    import tomllib
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
 
     pyproject_path = PROJECT_ROOT / "pyproject.toml"
     with open(pyproject_path, "rb") as f:
