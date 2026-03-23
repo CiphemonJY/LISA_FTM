@@ -1,4 +1,3 @@
-# ---------------------------------------------------------------------------
 # LISA-FTM Autoresearch Experiment Configuration
 # ---------------------------------------------------------------------------
 # Edit this file to propose new experiments.

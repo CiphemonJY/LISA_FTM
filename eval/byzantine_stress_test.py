@@ -361,6 +361,25 @@ class LoraAppliedModel:
                         p.requires_grad = True
                     break
 
+    def unfreeze_lora_A_only(self, layer_indices: Optional[List[int]] = None):
+        """Unfreeze only lora_A (not lora_B) for selected layers.
+        This prevents lora_B — which starts at zero — from receiving large
+        gradient updates that catastrophically perturb the model output."""
+        if layer_indices is None:
+            for lora_layer in self.lora_layers.values():
+                lora_layer.lora_A.requires_grad = True
+                lora_layer.lora_B.requires_grad = False
+        else:
+            patterns = []
+            for idx in layer_indices:
+                patterns.extend([f"gpt_neox.layers.{idx}.", f".h.{idx}."])
+            for full_name, lora_layer in self.lora_layers.items():
+                for pat in patterns:
+                    if pat in full_name:
+                        lora_layer.lora_A.requires_grad = True
+                        lora_layer.lora_B.requires_grad = False
+                        break
+
     def get_trainable_count(self) -> int:
         return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
