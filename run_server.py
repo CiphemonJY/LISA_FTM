@@ -103,32 +103,117 @@ def main():
     class RegisterRequest(BaseModel):
         client_id: str
 
-    @app.get("/")
+    @app.get(
+        "/",
+        summary="Server info",
+        description="Returns basic server identity and running status.",
+        responses={
+            200: {"description": "Server is running and ready."},
+        },
+    )
     async def root():
+        """
+        Server info endpoint.
+
+        Returns a simple status message confirming the server is running.
+        """
         return {"message": "LISA Federated Learning Server", "status": "running"}
 
-    @app.get("/status")
+    @app.get(
+        "/status",
+        summary="Server status",
+        description="Returns the current state of the federated learning server including round progress, registered clients, and gradient counts.",
+        responses={
+            200: {"description": "Current server status."},
+        },
+    )
     async def status():
+        """
+        Get the current federated server status.
+
+        Returns the global round number, number of registered and active clients,
+        total gradients received/rejected, and the current model configuration.
+        """
         return server.get_status()
 
-    @app.post("/register")
+    @app.post(
+        "/register",
+        summary="Register a client",
+        description="Register a new federated learning client with the server. Returns the client's assigned ID and initial state.",
+        responses={
+            200: {"description": "Client registered successfully."},
+            409: {"description": "Client ID already registered."},
+            422: {"description": "Validation error (e.g., missing client_id)."},
+        },
+    )
     async def register(req: RegisterRequest):
+        """
+        Register a new client with the federated server.
+
+        Clients must register before submitting gradients. Registration is
+        idempotent — re-registering the same client ID returns success.
+        """
         return server.register_client(req.client_id)
 
-    @app.post("/submit")
+    @app.post(
+        "/submit",
+        summary="Submit a gradient update",
+        description="Submit a compressed gradient update from a client for the current round. The server validates, stores, and aggregates the update.",
+        responses={
+            200: {"description": "Gradient accepted and queued for aggregation."},
+            400: {"description": "Gradient rejected (e.g., wrong round, stale update, validation failure)."},
+            422: {"description": "Validation error in request body."},
+        },
+    )
     async def submit(req: GradientSubmitRequest):
+        """
+        Submit a gradient update from a client for a specific round.
+
+        The request body should include the client's ID, round number, gradient
+        statistics (norm, loss before/after), compression metadata, and the
+        base64-encoded compressed gradient data.
+        """
         update = req.model_dump()
         return server.receive_gradient(update)
 
-    @app.get("/round/{round_num}")
+    @app.get(
+        "/round/{round_num}",
+        summary="Round status",
+        description="Returns the status and gradient details for a specific federated round.",
+        responses={
+            200: {"description": "Round details including accepted gradients and aggregation status."},
+            404: {"description": "Round not yet started or does not exist."},
+        },
+    )
     async def get_round(round_num: int):
+        """
+        Get the status of a specific round.
+
+        Returns the round number, number of gradients received, aggregation
+        status, and per-client gradient details if available.
+        """
         result = server.get_round_status(round_num)
         if result is None:
             return {"error": "Round not found"}
         return result
 
-    @app.get("/model/{client_id}")
+    @app.get(
+        "/model/{client_id}",
+        summary="Get model update for client",
+        description="Fetch the latest aggregated model checkpoint available for a specific client, optionally filtered to updates since a given round.",
+        responses={
+            200: {"description": "Model update metadata including round number and size."},
+            404: {"description": "No model update available for this client."},
+        },
+    )
     async def get_model(client_id: str, since_round: int = 0):
+        """
+        Retrieve the latest aggregated model update for a client.
+
+        Returns metadata about the model update including the round number
+        and model size. Use this to know when a new aggregated model is
+        available for local training.
+        """
         update = server.get_model_update(client_id, since_round)
         if update is None:
             return {"error": "No model update available"}

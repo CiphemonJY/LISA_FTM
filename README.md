@@ -142,6 +142,88 @@ Combined with **LoRA** (Low-Rank Adaptation), only 0.2-0.3% of model parameters 
 
 ---
 
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        Federated Learning Flow                           │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  Device A (hospital-1)          Server                  Device B (hospital-2)
+  ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+  │  Local Dataset   │    │                  │    │  Local Dataset   │
+  │  (never leaves)  │    │  FederatedServer │    │  (never leaves)  │
+  │                  │    │                  │    │                  │
+  │  LISA Training   │    │  • Aggregates    │    │  LISA Training   │
+  │  LoRA + layer    │    │  • Checkpoints    │    │  LoRA + layer    │
+  │  selection       │    │  • Coordinates    │    │  selection       │
+  │                  │    │                  │    │                  │
+  │  → gradients     │──▶ │  FedAvg merge    │──▶ │  ← model update  │
+  └──────────────────┘    │                  │    └──────────────────┘
+                         └──────────────────┘
+                                  ▲
+                                  │
+                         ┌──────────────────┐
+                         │  Device C (GPU)  │
+                         │  trains larger   │
+                         │  model locally   │
+                         └──────────────────┘
+```
+
+- Each device trains **only on local data** — data never leaves the device
+- Only **gradient updates** (compressed tensors) are shared with the server
+- The server runs **FedAvg** aggregation and distributes the averaged model back
+- **Any model size** works — from 70M to 70B params — because each device trains only what its hardware allows
+- **Differential privacy** (optional): add noise to gradients client-side before sharing
+
+## Multi-Device Federated Learning
+
+Run federated learning across multiple machines or devices:
+
+### Step 1: Start the server (on one machine or a cloud VPS)
+```bash
+python run_server.py --model EleutherAI/pythia-70m --rounds 5 --port 8080 --host 0.0.0.0
+```
+> The server must be reachable from your other devices. Use your machine's LAN IP (e.g. `192.168.1.x`) instead of `localhost` if devices are on the same network.
+
+### Step 2: Start clients on each device (can be the same machine or different)
+```bash
+# Device 1 (e.g., your desktop)
+python run_client.py --client-id desktop-1 --server http://192.168.1.x:8080 --rounds 5
+
+# Device 2 (e.g., a Mac Mini on the network)
+python run_client.py --client-id mac-mini-1 --server http://192.168.1.x:8080 --rounds 5
+
+# Device 3 (e.g., a Jetson Nano)
+python run_client.py --client-id jetson-1 --server http://192.168.1.x:8080 --rounds 5
+```
+
+### Step 3: Monitor progress
+```bash
+# Check server status
+curl http://localhost:8080/status
+
+# Or open the interactive API docs
+# http://localhost:8080/docs
+```
+
+### Running everything on one machine (no network needed)
+```bash
+python main.py --mode simulate --clients 3 --rounds 3
+```
+
+### Server startup examples
+```bash
+# Small model, 3 rounds, local testing
+python run_server.py --model distilgpt2 --rounds 3 --port 8080
+
+# Larger model, more rounds
+python run_server.py --model EleutherAI/pythia-70m --rounds 10 --port 8080
+
+# Require minimum 2 clients per round before aggregating
+python run_server.py --model EleutherAI/pythia-70m --rounds 5 --min-clients 2
+```
+
 ## Federated Privacy
 
 Data never leaves the local device:

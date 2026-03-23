@@ -259,20 +259,52 @@ def cmd_server(args):
     class RegisterRequest(BaseModel):
         client_id: str
 
-    @app.get("/")
+    @app.get(
+        "/",
+        summary="Server info",
+        description="Returns basic server identity and running status.",
+        responses={200: {"description": "Server is running."}},
+    )
     async def root():
+        """Server info endpoint."""
         return {"message": "LISA Federated Learning Server", "status": "running"}
 
-    @app.get("/status")
+    @app.get(
+        "/status",
+        summary="Server status",
+        description="Returns the current state of the server: round progress, registered clients, gradient counts, and model config.",
+        responses={200: {"description": "Current server status."}},
+    )
     async def status():
+        """Get the current federated server status."""
         return server.get_status()
 
-    @app.post("/register")
+    @app.post(
+        "/register",
+        summary="Register a client",
+        description="Register a new client with the server. Returns the client's assigned ID.",
+        responses={
+            200: {"description": "Client registered."},
+            409: {"description": "Client already registered."},
+            422: {"description": "Validation error."},
+        },
+    )
     async def register(req: RegisterRequest):
+        """Register a new client with the federated server."""
         return server.register_client(req.client_id)
 
-    @app.post("/submit")
+    @app.post(
+        "/submit",
+        summary="Submit a gradient update",
+        description="Submit a compressed gradient update for aggregation. Include client_id, round_number, gradient norm, loss values, and base64-encoded gradient data.",
+        responses={
+            200: {"description": "Gradient accepted."},
+            400: {"description": "Gradient rejected (wrong round, stale, validation failure)."},
+            422: {"description": "Validation error."},
+        },
+    )
     async def submit(req: GradientSubmitRequest):
+        """Submit a gradient update from a client for aggregation."""
         return server.receive_gradient(req.model_dump())
 
     print(f"Server starting on http://0.0.0.0:{args.port}")
