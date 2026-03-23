@@ -1,0 +1,52 @@
+{
+  "experiment": "Byzantine Resilience Stress Test (Suite 3)",
+  "run_label": "suite3a_adaptive",
+  "byzantine_method": "none",
+  "n_malicious": 0,
+  "attack_type": "none",
+  "model": "EleutherAI/pythia-70m",
+  "num_clients": 3,
+  "num_rounds": 3,
+  "local_epochs": 1,
+  "batch_size": 4,
+  "lr": 0.0008,
+  "lisa_bottom": 2,
+  "lisa_top": 2,
+  "lisa_middle": 2,
+  "lora_rank": 4,
+  "rounds": [
+    {
+      "round": 1,
+      "avg_test_perplexity": 8.774968014998724e+122,
+      "avg_train_loss": 278.43656085332236,
+      "total_comm_tensors": 144,
+      "malicious_injected": []
+    },
+    {
+      "round": 2,
+      "avg_test_perplexity": 8.752954818584393e+122,
+      "avg_train_loss": 323.52816974321996,
+      "total_comm_tensors": 144,
+      "malicious_injected": []
+    },
+    {
+      "round": 3,
+      "avg_test_perplexity": 8.730100956869054e+122,
+      "avg_train_loss": 283.6906453450521,
+      "total_comm_tensors": 144,
+      "malicious_injected": []
+    }
+  ],
+  "final_perplexity": 8.730100956869054e+122,
+  "perplexity_curve": [
+    8.774968014998724e+122,
+    8.752954818584393e+122,
+    8.730100956869054e+122
+  ],
+  "comm_tensors_per_round": [
+    144,
+    144,
+    144
+  ],
+  "total_comm_tensors": 432
+}

@@ -654,9 +654,10 @@ class FederatedServer:
         # Compute round time before completing
         completed_at = time.time()
         round_time = completed_at - rs.started_at
+        # Use total_rounds + 1 as divisor (total_rounds not yet incremented)
         self.metrics.avg_round_time = (
-            (self.metrics.avg_round_time * (self.metrics.total_rounds - 1) + round_time)
-            / self.metrics.total_rounds
+            (self.metrics.avg_round_time * self.metrics.total_rounds + round_time)
+            / (self.metrics.total_rounds + 1)
         )
 
         # Save versioned checkpoint with metadata

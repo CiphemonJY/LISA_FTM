@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "<string>", line 5, in <module>
+    exec(open('C:/Users/james/.openclaw/workspace/lisa-autoresearch/quick_lr_test.py').read())
+    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 4, in <module>
+    sys.stderr = open('quick_lr_test2.err', 'w', buffering=1)
+                                       ^^^^^^^^
+NameError: name '__file__' is not defined. Did you mean: '__name__'?
