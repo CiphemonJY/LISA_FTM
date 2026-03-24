@@ -309,7 +309,7 @@ def cmd_mlx(args):
             labels = mx.concatenate([batch[:, 1:], mx.zeros((batch.shape[0], 1), dtype=batch.dtype)], axis=1)
             logits = model(batch)
             # Flatten for cross-entropy
-            loss = mx.mean(mx.nn.losses.cross_entropy(
+            loss = mx.mean(nn.losses.cross_entropy(
                 logits[:, :-1].reshape(-1, logits.shape[-1]),
                 labels[:, 1:].reshape(-1)
             ))
