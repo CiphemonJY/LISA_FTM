@@ -174,6 +174,7 @@ def cmd_train(args):
         batch_size=args.batch_size,
         max_seq=args.max_seq,
         output_dir=args.output_dir or "output/lisa_torch",
+        device="auto",
     )
     print(f"\nResult: {result.get('status')}")
     if result.get("status") == "success":

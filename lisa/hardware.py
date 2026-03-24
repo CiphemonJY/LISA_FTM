@@ -68,15 +68,29 @@ def get_cpu_info() -> Tuple[str, int, int]:
     system = platform.system()
 
     if system == "Darwin":
-        try:
-            brand = subprocess.check_output(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-                stderr=subprocess.DEVNULL, timeout=5
-            ).decode().strip()
-            if brand:
-                cpu_brand = brand
-        except:
-            pass
+        # Try /usr/sbin/sysctl first (not always in PATH), then fallback to psutil
+        for cmd in ["/usr/sbin/sysctl", "sysctl"]:
+            try:
+                brand = subprocess.check_output(
+                    [cmd, "-n", "machdep.cpu.brand_string"],
+                    stderr=subprocess.DEVNULL, timeout=5
+                ).decode().strip()
+                if brand:
+                    cpu_brand = brand
+                    break
+            except Exception:
+                continue
+        # Fallback to psutil
+        if cpu_brand == "Unknown":
+            try:
+                import psutil
+                cpu_brand = psutil.cpu_freq().current if psutil.cpu_freq() else "Apple Silicon"
+                if psutil.cpu_freq():
+                    cpu_brand = f"Apple Silicon @ {psutil.cpu_freq().current:.0f}MHz"
+                else:
+                    cpu_brand = "Apple Silicon"
+            except Exception:
+                pass
 
     elif system == "Linux":
         try:
@@ -111,22 +125,36 @@ def get_memory_info() -> Tuple[float, float]:
     system = platform.system()
 
     if system == "Darwin":
+        # Primary: use psutil (most reliable on macOS)
         try:
-            # Total memory
-            total_b = int(subprocess.check_output(
-                ["sysctl", "-n", "hw.memsize"], stderr=subprocess.DEVNULL, timeout=5
-            ).decode().strip())
-            total_gb = total_b / (1024 ** 3)
+            import psutil
+            vm = psutil.virtual_memory()
+            total_gb = vm.total / (1024 ** 3)
+            available_gb = vm.available / (1024 ** 3)
+            return total_gb, available_gb
+        except Exception as e:
+            logger.warning(f"psutil memory detection failed: {e}")
 
-            # Available: free + inactive pages
+        # Fallback: use sysctl + vm_stat
+        try:
+            for cmd in ["/usr/sbin/sysctl", "sysctl"]:
+                try:
+                    total_b = int(subprocess.check_output(
+                        [cmd, "-n", "hw.memsize"], stderr=subprocess.DEVNULL, timeout=5
+                    ).decode().strip())
+                    total_gb = total_b / (1024 ** 3)
+                    break
+                except Exception:
+                    continue
+
             vm = subprocess.check_output(["vm_stat"], stderr=subprocess.DEVNULL, timeout=5).decode()
 
-            page_size = 4096  # Default, will be refined below
+            page_size = 4096
             for line in vm.split("\n"):
                 if "page size" in line.lower():
                     try:
                         page_size = int(line.split("(")[1].split()[0])
-                    except:
+                    except Exception:
                         pass
 
             free_pages = inactive_pages = 0
@@ -134,12 +162,12 @@ def get_memory_info() -> Tuple[float, float]:
                 if "Pages free" in line:
                     try:
                         free_pages = int(line.split(":")[1].strip().rstrip("."))
-                    except:
+                    except Exception:
                         pass
                 elif "Pages inactive" in line:
                     try:
                         inactive_pages = int(line.split(":")[1].strip().rstrip("."))
-                    except:
+                    except Exception:
                         pass
 
             available_gb = (free_pages + inactive_pages) * page_size / (1024 ** 3)
@@ -194,46 +222,7 @@ def get_gpu_info() -> Tuple[bool, Optional[str], Optional[float], Optional[str]]
 
     system = platform.system()
 
-    # Check for Apple Silicon GPU
-    if system == "Darwin":
-        try:
-            brand = subprocess.check_output(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-                stderr=subprocess.DEVNULL, timeout=5
-            ).decode().strip()
-            if any(x in brand for x in ["Apple", "M1", "M2", "M3", "M4"]):
-                gpu_available = True
-                gpu_name = "Apple GPU (Unified Memory)"
-                gpu_type = "mps"
-                # Apple Silicon uses unified memory
-                total_ram, _ = get_memory_info()
-                gpu_memory_gb = total_ram
-                return gpu_available, gpu_name, gpu_memory_gb, gpu_type
-        except:
-            pass
-
-    # Check for CUDA GPU
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            parts = result.stdout.strip().split(",")
-            if len(parts) >= 2:
-                gpu_name = parts[0].strip()
-                mem_str = parts[1].strip()
-                if "MiB" in mem_str:
-                    gpu_memory_gb = float(mem_str.split()[0]) / 1024
-                elif "GiB" in mem_str:
-                    gpu_memory_gb = float(mem_str.split()[0])
-                gpu_available = True
-                gpu_type = "cuda"
-                return gpu_available, gpu_name, gpu_memory_gb, gpu_type
-    except:
-        pass
-
-    # Check for torch CUDA (in any Python environment)
+    # Check for CUDA first (works in any Python env with torch)
     try:
         import torch
         if torch.cuda.is_available():
@@ -242,8 +231,58 @@ def get_gpu_info() -> Tuple[bool, Optional[str], Optional[float], Optional[str]]
             gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             gpu_type = "cuda"
             return gpu_available, gpu_name, gpu_memory_gb, gpu_type
-    except:
+    except Exception:
         pass
+
+    # Check for Apple Silicon / MPS (PyTorch on Mac)
+    if system == "Darwin":
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                gpu_available = True
+                gpu_type = "mps"
+                # MPS uses unified memory - get from system
+                total_ram, _ = get_memory_info()
+                gpu_memory_gb = total_ram if total_ram > 0 else None
+
+                # Try to get chip name
+                for cmd in ["/usr/sbin/sysctl", "sysctl"]:
+                    try:
+                        brand = subprocess.check_output(
+                            [cmd, "-n", "machdep.cpu.brand_string"],
+                            stderr=subprocess.DEVNULL, timeout=5
+                        ).decode().strip()
+                        if brand and "Apple" in brand:
+                            gpu_name = f"{brand} (MPS)"
+                            break
+                    except Exception:
+                        continue
+                if not gpu_name:
+                    gpu_name = "Apple GPU (MPS)"
+
+                return gpu_available, gpu_name, gpu_memory_gb, gpu_type
+        except Exception:
+            pass
+
+        # Fallback: check chip name via sysctl
+        try:
+            for cmd in ["/usr/sbin/sysctl", "sysctl"]:
+                try:
+                    brand = subprocess.check_output(
+                        [cmd, "-n", "machdep.cpu.brand_string"],
+                        stderr=subprocess.DEVNULL, timeout=5
+                    ).decode().strip()
+                    if brand and "Apple" in brand:
+                        gpu_available = True
+                        gpu_name = f"{brand} (Unified Memory)"
+                        gpu_type = "mps"
+                        total_ram, _ = get_memory_info()
+                        gpu_memory_gb = total_ram if total_ram > 0 else None
+                        return gpu_available, gpu_name, gpu_memory_gb, gpu_type
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     return gpu_available, gpu_name, gpu_memory_gb, gpu_type
 
@@ -257,8 +296,9 @@ def get_disk_info() -> Tuple[float, float]:
 
     try:
         if system == "Darwin":
+            # Use df without -g (plain df returns 512-byte blocks)
             result = subprocess.run(
-                ["df", "-g", str(Path.home())],
+                ["df", str(Path.home())],
                 capture_output=True, text=True, timeout=10
             )
             if result.returncode == 0:
@@ -266,8 +306,11 @@ def get_disk_info() -> Tuple[float, float]:
                 if len(lines) >= 2:
                     parts = lines[1].split()
                     if len(parts) >= 4:
-                        available_gb = float(parts[3])
-                        total_gb = float(parts[1])
+                        # parts[1]=512-byte blocks total, parts[3]=available
+                        total_blocks = float(parts[1])
+                        avail_blocks = float(parts[3])
+                        total_gb = total_blocks * 512 / (1024 ** 3)
+                        available_gb = avail_blocks * 512 / (1024 ** 3)
 
         elif system == "Linux":
             result = subprocess.run(

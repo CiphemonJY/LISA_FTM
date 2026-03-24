@@ -20,11 +20,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("real-train")
 
-DEVICE = "cpu"
-DTYPE = torch.float32
+import torch
+# Detect best device for Apple Silicon Mac
+if torch.backends.mps.is_available():
+    DEVICE = "mps"
+    DTYPE = torch.float32
+else:
+    DEVICE = "cpu"
+    DTYPE = torch.float32
+print(f"[macOS] Using device: {DEVICE}")
 
 # ─── Model ───────────────────────────────────────────────────────────────────
-MODEL_ID = "EleutherAI/pythia-70m"   # 14M params, nn.Linear, LoRA-friendly
+MODEL_ID = "EleutherAI/pythia-160m"   # 14M params, nn.Linear, LoRA-friendly
 
 # ─── Dataset ────────────────────────────────────────────────────────────────
 # Using wikitext for language modeling (no tokenization headaches)
@@ -71,9 +78,10 @@ def main():
     )
     model.resize_token_embeddings(len(tokenizer))
     n_params = sum(p.numel() for p in model.parameters())
-    log.info(f"  Model loaded: {n_params:,} params in {time.time()-t0:.1f}s")
 
-    # ── Apply LoRA ─────────────────────────────────────────────────────────
+    # ── Apply LoRA BEFORE moving to MPS ───────────────────────────────────
+    # LoRA params are created as CPU Parameters; we must move the full
+    # model to MPS AFTER LoRA application so all params end up on MPS.
     log.info("Applying LoRA...")
     from lisa.train_torch import LoRALinear
     import torch.nn as nn
@@ -100,6 +108,10 @@ def main():
                 log.debug(f"Could not apply LoRA to {full_name}: {e}")
 
     log.info(f"  LoRA applied to {lora_count} layers")
+
+    # ── Move model to MPS device ─────────────────────────────────────────
+    model = model.to(DEVICE)
+    log.info(f"  Model on device: {next(model.parameters()).device}")
 
     # Freeze all except LoRA
     for name, param in model.named_parameters():
@@ -225,7 +237,7 @@ def main():
     ]
     for prompt in prompts:
         inputs = tokenizer(prompt, return_tensors="pt", return_attention_mask=False)
-        inputs = {k: v.clamp(0, tokenizer.vocab_size - 1) for k, v in inputs.items()}
+        inputs = {k: v.clamp(0, tokenizer.vocab_size - 1).to(DEVICE) for k, v in inputs.items()}
         with torch.no_grad():
             outputs = model.generate(
                 **inputs, max_new_tokens=15,

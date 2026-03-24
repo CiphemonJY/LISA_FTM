@@ -65,7 +65,12 @@ class LISAConfig:
     lora_alpha: float = 16.0
     lora_dropout: float = 0.05
     lora_target_modules: List[str] = field(
-        default_factory=lambda: ["c_attn", "c_proj", "c_fc", "c_proj"]
+        default_factory=lambda: [
+            # GPT-2 / GPT-NeoX compatible
+            "c_attn", "c_proj", "c_fc", "c_proj",
+            # GPT-NeoX (Pythia, OLMo, etc.)
+            "query_key_value", "dense", "mlp",
+        ]
     )
 
     # Training parameters
@@ -413,6 +418,16 @@ def generate_synthetic_data(num_samples: int = 500, domain: str = "general") -> 
     return texts
 
 
+def _get_device() -> str:
+    """Auto-detect best available device."""
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def train(
     model_id: str = "microsoft/phi-2",
     iters: int = 100,
@@ -423,11 +438,13 @@ def train(
     batch_size: int = 2,
     max_seq: int = 256,
     output_dir: str = "output/lisa_trained",
-    device: str = "cpu",
+    device: str = "auto",
 ) -> Dict[str, Any]:
     """
     Run LISA-style training with PyTorch.
     """
+    if device == "auto":
+        device = _get_device()
     config = LISAConfig(
         model_id=model_id,
         bottom_layers=bottom_layers,
@@ -449,6 +466,9 @@ def train(
 
     # Setup LoRA
     lora_count = trainer.setup_lora()
+
+    # Move model to target device (must be AFTER LoRA to move LoRA params too)
+    trainer.model = trainer.model.to(device)
 
     # Select layers
     selected = trainer.select_layers(seed=42)
