@@ -89,6 +89,60 @@ class OffloadConfig:
     output_dir: str = "output/offloaded"
 
 
+def estimate_model_size(config: AutoConfig, dtype: str = "float16") -> float:
+    """
+    Estimate model size in GB from an AutoConfig object.
+
+    Calculates actual parameter count from config values:
+    - Embeddings: vocab_size * hidden_size * 2 (input + position)
+    - Attention: 4 * hidden_size^2 * num_layers (Q, K, V projections + output)
+    - FFN: 2 * hidden_size * intermediate_size * num_layers (gate/up + down)
+    - Output head: vocab_size * hidden_size (lm_head, if present)
+
+    Returns total size in GB for the given dtype.
+    """
+    hidden_size = getattr(config, "hidden_size", 0)
+    num_layers = getattr(config, "num_hidden_layers", 0)
+    intermediate_size = getattr(config, "intermediate_size", 0)
+    vocab_size = getattr(config, "vocab_size", 0)
+
+    if not all([hidden_size, num_layers, intermediate_size, vocab_size]):
+        # Fallback: cannot estimate from partial config
+        return 0.0
+
+    # Embeddings: input + position (rough approximation; some models share)
+    embed_params = vocab_size * hidden_size * 2
+
+    # Attention: Q, K, V (each hidden_size^2) + O projection (hidden_size^2)
+    # = 4 * hidden_size^2 per layer
+    attn_params = 4 * hidden_size * hidden_size * num_layers
+
+    # FFN: gate_proj (hidden_size * intermediate_size) + up_proj + down_proj
+    # up_proj = hidden_size * intermediate_size, down_proj = intermediate_size * hidden_size
+    # Some configs list gate_proj/up_proj/down_proj, some just have intermediate_size
+    ffn_params = 2 * hidden_size * intermediate_size * num_layers
+
+    # LM head (output projection) — usually tied with embeddings, but count separately
+    lm_head_params = vocab_size * hidden_size
+
+    total_params = embed_params + attn_params + ffn_params + lm_head_params
+
+    # Bytes per element by dtype
+    dtype_bytes = {"float32": 4, "float16": 2, "bfloat16": 2, "int8": 1, "int4": 0.5}
+    bpe = dtype_bytes.get(dtype, 2)
+
+    model_size_gb = total_params * bpe / 1e9
+
+    # Log breakdown for debugging
+    logger.debug(
+        f"Model size estimate: {total_params:,} params | "
+        f"embed={embed_params:,} attn={attn_params:,} ffn={ffn_params:,} "
+        f"lm_head={lm_head_params:,} | dtype={dtype} -> {model_size_gb:.3f} GB"
+    )
+
+    return model_size_gb
+
+
 def get_layer_groups(model: torch.nn.Module, num_groups: int) -> List[List[torch.nn.Module]]:
     """
     Split model layers into groups for sequential processing.
@@ -271,37 +325,46 @@ class DiskOffloadedTrainer:
         return Path(tempfile.mkdtemp(prefix="lisa_offload_"))
 
     def estimate_model_size(self) -> Dict[str, float]:
-        """Estimate model size and memory requirements."""
-        if "70B" in self.config.model_id:
-            params_b = 70
-        elif "32B" in self.config.model_id:
-            params_b = 32
-        elif "14B" in self.config.model_id:
-            params_b = 14
-        elif "7B" in self.config.model_id:
-            params_b = 7
-        elif "3B" in self.config.model_id:
-            params_b = 3
-        elif "1.5B" in self.config.model_id:
-            params_b = 1.5
-        elif "1.1B" in self.config.model_id:
-            params_b = 1.1
+        """Estimate model size and memory requirements from actual config."""
+        # Load config to get real parameter counts
+        try:
+            config = AutoConfig.from_pretrained(
+                self.config.model_id, trust_remote_code=True
+            )
+        except Exception as e:
+            logger.warning(f"Could not load config for {self.config.model_id}: {e}")
+            # Fallback to rough string-based estimate
+            model_id_lower = self.config.model_id.lower()
+            if "70b" in model_id_lower:
+                params_b = 70
+            elif "32b" in model_id_lower:
+                params_b = 32
+            elif "14b" in model_id_lower:
+                params_b = 14
+            elif "7b" in model_id_lower:
+                params_b = 7
+            elif "3b" in model_id_lower:
+                params_b = 3
+            elif "1.5b" in model_id_lower:
+                params_b = 1.5
+            elif "1.1b" in model_id_lower:
+                params_b = 1.1
+            else:
+                params_b = 7
+            model_size_gb = params_b * 2  # float16
+            params_b_actual = params_b
         else:
-            params_b = 7
+            model_size_gb = estimate_model_size(config, dtype="float16")
+            # Compute actual parameter count from size
+            params_b_actual = model_size_gb / 2  # float16 = 2 bytes
 
-        # 4-bit: ~0.5 bytes/param, 8-bit: ~1 byte/param, 16-bit: ~2 bytes/param
-        precision_bytes = {"float32": 4, "float16": 2, "bfloat16": 2, "int8": 1, "int4": 0.5}
-        bpe = precision_bytes.get("float16", 2)
-
-        model_size_gb = params_b * bpe
         group_size_gb = model_size_gb / max(1, self.config.layer_groups)
         activations_gb = group_size_gb * 0.5
         peak_gb = group_size_gb + activations_gb
-
         disk_gb = activations_gb * self.config.layer_groups * 2
 
         return {
-            "params_billion": params_b,
+            "params_billion": params_b_actual,
             "model_size_gb": model_size_gb,
             "group_size_gb": group_size_gb,
             "activations_gb": activations_gb,
