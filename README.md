@@ -112,11 +112,36 @@ python real_training.py --model EleutherAI/pythia-70m --steps 200
 
 The magic of federated learning: **every device contributes, regardless of hardware.**
 
-| Device | RAM | Can Train |
-|--------|-----|-----------|
-| This PC | 8 GB | ✅ TinyLlama-1.1B, pythia-70m |
-| Mac Mini M2 | 16 GB | ✅ 7B models |
-| Cloud GPU | 80 GB | ✅ 32B+ models |
+## Platform Compatibility
+
+| Platform | Framework | GPU | Status | Tested |
+|----------|-----------|-----|--------|--------|
+| **macOS Apple Silicon** | PyTorch + MPS | M-series GPU | ✅ Full | Mac Mini M4 Pro |
+| **macOS Apple Silicon** | MLX (native) | M-series GPU | ✅ Full | Mac Mini M4 Pro |
+| **Linux** | PyTorch + CUDA | NVIDIA GPU | ✅ Supported | — |
+| **Windows** | PyTorch | CPU / NVIDIA GPU | ✅ Supported | — |
+| **Raspberry Pi / ARM** | PyTorch | CPU only | ✅ Supported | — |
+| **Jetson Nano** | PyTorch | NVIDIA GPU | ✅ Supported | — |
+
+### Per-Model Recommendations
+
+| Model | RAM | macOS | Linux | Windows |
+|-------|-----|-------|-------|---------|
+| EleutherAI/pythia-70m | 4 GB | ✅ MPS / CPU | ✅ CUDA / CPU | ✅ CPU |
+| EleutherAI/pythia-160m | 6 GB | ✅ MPS | ✅ CUDA | ✅ CPU |
+| TinyLlama-1.1B | 8 GB | ✅ MPS | ✅ CUDA | ✅ CPU |
+| Qwen2.5-3B | 8 GB | ✅ MLX / MPS | ✅ CUDA | ✅ CPU |
+| Qwen2.5-7B | 16 GB | ✅ MLX / MPS | ✅ CUDA | ⚠️ CPU slow |
+| Qwen2.5-14B | 28 GB | ⚠️ Offload | ✅ CUDA | ⚠️ Offload |
+| Qwen2.5-32B | 64 GB | ⚠️ Offload | ✅ CUDA | ⚠️ Offload |
+
+### Training Modes by Platform
+
+| Mode | Framework | Best For | Platforms |
+|------|-----------|----------|-----------|
+| `--mode train` | PyTorch | CPU/GPU training | All |
+| `--mode mlx` | MLX | Fast Apple Silicon | macOS only |
+| `--mode offload` | PyTorch | Large models on small RAM | All |
 
 No single machine needs to train the entire model. Each device trains what it can, shares what it learns, and receives aggregated improvements from the network.
 

@@ -35,6 +35,9 @@ import numpy as np
 
 # PyTorch
 import torch
+# Monkey-patch: Conv1D was removed in PyTorch 2.x but GPT-NeoX/Pythia models still reference it
+if not hasattr(torch.nn, "Conv1D"):
+    torch.nn.Conv1D = torch.nn.Conv1d
 from torch.utils.data import Dataset, DataLoader
 
 # Transformers

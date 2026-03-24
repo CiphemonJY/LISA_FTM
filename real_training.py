@@ -6,6 +6,10 @@ Uses pythia-70m (14M params, proper nn.Linear) with LoRA on real eli5 dataset.
 import os, sys, time, torch, logging, argparse
 from pathlib import Path
 
+# Monkey-patch: Conv1D was removed in PyTorch 2.x but GPT-NeoX/Pythia models still reference it
+if not hasattr(torch.nn, "Conv1D"):
+    torch.nn.Conv1D = torch.nn.Conv1d
+
 # Setup
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))

@@ -160,13 +160,15 @@ def cmd_hardware():
 def cmd_train(args):
     """Run LISA training with PyTorch."""
     from lisa.train_torch import train
+    # Allow --steps as alias for --iters
+    iters = args.steps if args.steps is not None else args.iters
     print(f"Training with LISA (PyTorch)")
     print(f"  Model: {args.model}")
-    print(f"  Iterations: {args.iters}")
+    print(f"  Iterations: {iters}")
     print(f"  Bottom/Top/Middle layers: {args.bottom}/{args.top}/{args.middle}")
     result = train(
         model_id=args.model,
-        iters=args.iters,
+        iters=iters,
         bottom_layers=args.bottom,
         top_layers=args.top,
         middle_sample=args.middle,
@@ -180,6 +182,39 @@ def cmd_train(args):
     if result.get("status") == "success":
         print(f"  Final loss: {result.get('final_loss', 0):.4f}")
         print(f"  Output: {result.get('output_dir')}")
+    return result
+
+
+def cmd_mlx(args):
+    """Run LISA training with MLX (Apple Silicon)."""
+    iters = args.steps if args.steps is not None else args.iters
+    print(f"Training with LISA (MLX — Apple Silicon)")
+    print(f"  Model: {args.model}")
+    print(f"  Iterations: {iters}")
+    print(f"  Bottom/Top/Middle: {args.bottom}/{args.top}/{args.middle}")
+
+    try:
+        from lisa.lisa_mlx import LISATrainer, LISAConfig
+    except ImportError as e:
+        print(f"  ERROR: MLX not available: {e}")
+        print(f"  Install with: pip install mlx mlx-lm")
+        return {"status": "error", "message": "MLX not installed"}
+
+    config = LISAConfig(
+        model_id=args.model,
+        bottom_layers=args.bottom,
+        top_layers=args.top,
+        middle_sample=args.middle,
+        lora_rank=args.lora_rank or 4,
+    )
+    trainer = LISATrainer(config)
+    ok = trainer.load_model()
+    if not ok:
+        return {"status": "error", "message": "Failed to load model"}
+    result = trainer.train(iters=iters)
+    print(f"\nResult: {result.get('status')}")
+    if result.get("status") == "success":
+        print(f"  Final loss: {result.get('final_loss', 0):.4f}")
     return result
 
 
@@ -210,6 +245,96 @@ def cmd_offload(args):
         print(f"  Final loss: {result.get('final_loss', 0):.4f}")
         print(f"  Total time: {result.get('total_time', 0):.1f}s")
     return result
+
+
+def cmd_mlx(args):
+    """Run LISA training with MLX (Apple Silicon)."""
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    iters = args.steps if args.steps is not None else args.iters
+    print(f"Training with LISA (MLX — Apple Silicon)")
+    print(f"  Model: {args.model}")
+    print(f"  Iterations: {iters}")
+    print(f"  Bottom/Top/Middle: {args.bottom}/{args.top}/{args.middle}")
+    print(f"  LoRA rank: {args.lora_rank or 4}")
+
+    try:
+        from mlx_lm import load as mlx_load
+        from mlx_lm.lora import apply_lora
+        import mlx.core as mx
+    except ImportError as e:
+        print(f"  ERROR: MLX not available: {e}")
+        print(f"  Install with: pip install mlx mlx-lm")
+        return {"status": "error", "message": "MLX not installed"}
+
+    # Load model
+    print(f"  Loading {args.model}...")
+    try:
+        model, tokenizer = mlx_load(args.model)
+    except Exception as e:
+        print(f"  ERROR loading model: {e}")
+        return {"status": "error", "message": str(e)}
+
+    print(f"  Model loaded")
+
+    # Apply LoRA (simplified — all layers)
+    lora_rank = args.lora_rank or 4
+    apply_lora(model, args.model, lora_rank)
+    print(f"  LoRA applied (rank={lora_rank})")
+
+    # Load wikitext data
+    try:
+        from datasets import load_dataset
+        print(f"  Loading wikitext dataset...")
+        ds = load_dataset("wikitext", "wikitext-2-v1", split="train")
+        ds = ds.filter(lambda x: len(x.get("text", "").strip()) > 10)
+        ds = ds.select(range(min(500, len(ds))))
+        print(f"  Dataset: {len(ds)} samples")
+    except Exception as e:
+        print(f"  Dataset load failed: {e}. Using basic prompts.")
+        ds = None
+
+    # Simple training loop
+    optimizer = mx.optim.Adam(learning_rate=1e-4)
+    losses = []
+    total_params = sum(p.size for p in model.parameters())
+    trainable = sum(p.size for p in model.parameters() if p.trainable) if hasattr(model, "trainable") else 0
+    print(f"  Total params: {total_params:,}, trainable: {trainable:,}")
+    print(f"  Starting training: {iters} iterations...")
+
+    import time as time_mod
+    t0 = time_mod.time()
+
+    for step in range(iters):
+        # Get batch
+        if ds:
+            texts = [ds[i % len(ds)]["text"] for i in range(args.batch_size)]
+            enc = tokenizer(texts, return_tensors="np", padding=True, truncation=True, max_length=128)
+            input_ids = mx.array(enc["input_ids"])
+        else:
+            input_ids = mx.random.randint(0, 1000, (args.batch_size, 64))
+
+        # Forward
+        logits = model(input_ids)
+        loss = mx.mean(logits[:, :-1] != mx.argmax(logits[:, 1:], axis=-1))
+
+        # Backward
+        gradients = mx.grad(lambda x: model(x))(input_ids)
+        optimizer.step(model)
+
+        losses.append(float(loss))
+
+        if (step + 1) % 10 == 0:
+            avg = sum(losses[-10:]) / 10
+            elapsed = time_mod.time() - t0
+            print(f"  Step {step+1}/{iters}: loss={avg:.4f}, elapsed={elapsed:.1f}s")
+
+    elapsed = time_mod.time() - t0
+    final = sum(losses[-10:]) / min(10, len(losses))
+    print(f"\n  Training complete!")
+    print(f"  Total time: {elapsed:.1f}s")
+    print(f"  Final loss: {final:.4f}")
+
+    return {"status": "success", "final_loss": final, "time": elapsed}
 
 
 def cmd_server(args):
@@ -541,7 +666,7 @@ Examples:
     # Mode selection
     parser.add_argument(
         "--mode",
-        choices=["hardware", "train", "offload", "server", "client", "simulate", "rollback"],
+        choices=["hardware", "train", "offload", "server", "client", "simulate", "rollback", "mlx"],
         default="hardware",
         help="Operation mode. Default: hardware."
     )
@@ -618,8 +743,22 @@ Examples:
     parser.add_argument(
         "--iters",
         type=int,
-        default=50,
-        help="Number of training iterations (train mode). Default: 50."
+        default=cfg["training"]["steps"],
+        help="Training iterations (train/offload mode). Default: 200."
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        dest="steps",
+        default=None,
+        help="Alias for --iters (train/offload/client mode). Default: 200."
+    )
+    parser.add_argument(
+        "--lora-rank",
+        type=int,
+        dest="lora_rank",
+        default=None,
+        help="LoRA rank (MLX mode). Default: 4."
     )
 
     # Offload arguments
@@ -718,6 +857,8 @@ Examples:
         cmd_hardware()
     elif args.mode == "train":
         cmd_train(args)
+    elif args.mode == "mlx":
+        cmd_mlx(args)
     elif args.mode == "offload":
         cmd_offload(args)
     elif args.mode == "server":

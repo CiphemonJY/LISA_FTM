@@ -35,6 +35,10 @@ import numpy as np
 import torch
 import psutil
 
+# Monkey-patch: Conv1D was removed in PyTorch 2.x but GPT-NeoX/Pythia models still reference it
+if not hasattr(torch.nn, "Conv1D"):
+    torch.nn.Conv1D = torch.nn.Conv1d
+
 from federated.privacy import GradientPrivacy, DPConfig
 from federated.byzantine import ByzantineResilientAggregator
 from utils.checkpoint_manager import CheckpointManager

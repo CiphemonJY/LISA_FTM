@@ -35,6 +35,10 @@ import torch.nn as nn
 from dataclasses import dataclass as _dc, field as _field
 from typing import List as _List
 
+# Monkey-patch: Conv1D was removed in PyTorch 2.x but GPT-NeoX/Pythia models still reference it
+if not hasattr(nn, "Conv1D"):
+    nn.Conv1D = nn.Conv1d
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -59,7 +63,7 @@ class LoRALinear(nn.Module):
         self.alpha = alpha
         self.dropout_p = dropout
         self.target_module_name = target_module_name
-        self.is_conv1d = isinstance(linear, (nn.Conv1D, nn.modules.conv.Conv1d))
+        self.is_conv1d = isinstance(linear, (nn.Conv1d, nn.modules.conv.Conv1d))
 
         if self.is_conv1d:
             self.in_features = linear.in_channels
