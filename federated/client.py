@@ -98,8 +98,16 @@ def apply_lora_to_model(model: nn.Module, rank: int = 4, alpha: float = 8.0,
     Apply LoRA to all Linear/Conv1D layers in a model.
     Returns number of layers modified.
     """
-    target_names = ["c_attn", "c_proj", "c_fc", "query_key_value", "dense", "mlp",
-                    "q_proj", "k_proj", "v_proj", "o_proj"]
+    target_names = [
+        # GPT-2 / distilgpt2
+        "attn.c_proj", "attn.c_attn", "mlp.c_proj", "mlp.c_fc",
+        # GPT-NeoX (Pythia, OLMo)
+        "query_key_value", "dense", "mlp",
+        # Qwen/Llama (modern transformers)
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        # Generic fallback
+        "c_attn", "c_proj", "c_fc",
+    ]
     count = 0
     for full_name, module in model.named_modules():
         if not isinstance(module, (nn.Linear, nn.Conv1d)):
