@@ -160,8 +160,8 @@ def cmd_hardware():
 def cmd_train(args):
     """Run LISA training with PyTorch."""
     from lisa.train_torch import train
-    # Allow --steps as alias for --iters
-    iters = args.steps if args.steps is not None else args.iters
+    # Allow --steps or --train-steps as alias for --iters
+    iters = args.train_steps if args.train_steps is not None else args.iters
     print(f"Training with LISA (PyTorch)")
     print(f"  Model: {args.model}")
     print(f"  Iterations: {iters}")
@@ -182,39 +182,6 @@ def cmd_train(args):
     if result.get("status") == "success":
         print(f"  Final loss: {result.get('final_loss', 0):.4f}")
         print(f"  Output: {result.get('output_dir')}")
-    return result
-
-
-def cmd_mlx(args):
-    """Run LISA training with MLX (Apple Silicon)."""
-    iters = args.steps if args.steps is not None else args.iters
-    print(f"Training with LISA (MLX — Apple Silicon)")
-    print(f"  Model: {args.model}")
-    print(f"  Iterations: {iters}")
-    print(f"  Bottom/Top/Middle: {args.bottom}/{args.top}/{args.middle}")
-
-    try:
-        from lisa.lisa_mlx import LISATrainer, LISAConfig
-    except ImportError as e:
-        print(f"  ERROR: MLX not available: {e}")
-        print(f"  Install with: pip install mlx mlx-lm")
-        return {"status": "error", "message": "MLX not installed"}
-
-    config = LISAConfig(
-        model_id=args.model,
-        bottom_layers=args.bottom,
-        top_layers=args.top,
-        middle_sample=args.middle,
-        lora_rank=args.lora_rank or 4,
-    )
-    trainer = LISATrainer(config)
-    ok = trainer.load_model()
-    if not ok:
-        return {"status": "error", "message": "Failed to load model"}
-    result = trainer.train(iters=iters)
-    print(f"\nResult: {result.get('status')}")
-    if result.get("status") == "success":
-        print(f"  Final loss: {result.get('final_loss', 0):.4f}")
     return result
 
 
@@ -450,7 +417,8 @@ def cmd_client(args):
     config = DEFAULT_CONFIG.copy()
     config["model_name"] = args.model
     config["model_name_fallback"] = args.model
-    config["max_train_steps"] = args.steps
+    steps = args.train_steps if args.train_steps is not None else args.steps
+    config["max_train_steps"] = steps
     config["local_epochs"] = args.epochs
     config["batch_size"] = args.batch_size
 
@@ -747,11 +715,11 @@ Examples:
         help="Training iterations (train/offload mode). Default: 200."
     )
     parser.add_argument(
-        "--steps",
+        "--train-steps",
         type=int,
-        dest="steps",
+        dest="train_steps",
         default=None,
-        help="Alias for --iters (train/offload/client mode). Default: 200."
+        help="Alias for --iters (train/offload mode). Default: 200."
     )
     parser.add_argument(
         "--lora-rank",
