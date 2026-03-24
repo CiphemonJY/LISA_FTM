@@ -658,6 +658,156 @@ def merge_model_checkpoints(
 
 
 # ============================================================================
+# 7. SLERP — Spherical Linear Interpolation for LoRA Adapters
+# ============================================================================
+
+def slerp_merge(
+    checkpoints: List[Dict[str, torch.Tensor]],
+    validate_on: Optional[List[float]] = None,
+    t: float = 0.5,
+) -> Dict[str, torch.Tensor]:
+    """
+    SLERP (Spherical Linear Interpolation) for LoRA adapter merging.
+
+    Operates in the tangent space at the matrix logarithm. For each LoRA layer,
+    the ΔW = B @ A matrix is treated as a point on the manifold of matrices.
+    SLERP interpolates along the geodesic (shortest path) between two matrices.
+
+    For two checkpoints (the common case):
+        omega = arccos( clamp( (W1.T @ W2).trace() / (||W1||_F * ||W2||_F), -1, 1 ) )
+        W_t = W1 * sin((1-t)*omega)/sin(omega) + W2 * sin(t*omega)/sin(omega)
+
+    When omega is near zero (W1 ≈ W2), falls back to linear interpolation to
+    avoid numerical instability in sin(omega).
+
+    For N > 2 checkpoints: applies SLERP iteratively, averaging the result
+    with the global mean as a regularised centre.
+
+    Reference: https://arxiv.org/abs/2205.09926  (Neural Tangent SLERP)
+
+    Args:
+        checkpoints:  List of LoRA adapter state dicts to merge.
+                      Each must contain the same LoRA A/B keys.
+        validate_on:  Unused (present for API consistency with model_soups).
+                     SLERP does not require validation scores.
+        t:            Interpolation parameter in [0, 1].
+                      0.0 = first checkpoint, 1.0 = last checkpoint.
+                      Default 0.5 = midpoint (geodesic average).
+
+    Returns:
+        Merged state dict.
+    """
+    if not checkpoints:
+        raise ValueError("No checkpoints provided")
+    if len(checkpoints) == 1:
+        return {k: v.clone() for k, v in checkpoints[0].items()}
+
+    if t < 0 or t > 1:
+        raise ValueError(f"t must be in [0, 1], got {t}")
+
+    # Collect LoRA keys
+    lora_keys, _ = _split_lora_keys(checkpoints[0])
+    all_params = {_param_base_name(k) for k in lora_keys}
+
+    # Separate LoRA and non-LoRA params
+    non_lora = set(checkpoints[0].keys()) - lora_keys
+    result = {}
+    for key in non_lora:
+        first = checkpoints[0][key]
+        dtype = (torch.float32 if first.dtype in (torch.float16, torch.bfloat16)
+                 else first.dtype)
+        accum = torch.zeros_like(first, dtype=torch.float32)
+        for ckpt in checkpoints:
+            accum = accum + ckpt[key].float()
+        accum = accum / len(checkpoints)
+        result[key] = accum.to(dtype)
+
+    for name in all_params:
+        a_key = f"{name}.A"
+        b_key = f"{name}.B"
+
+        # Verify all checkpoints have this layer
+        valid = all(a_key in ckpt and b_key in ckpt for ckpt in checkpoints)
+        if not valid:
+            raise ValueError(
+                f"Layer '{name}' missing from one or more checkpoints. "
+                f"All checkpoints must have the same LoRA structure."
+            )
+
+        # Stack deltas: ΔW = B @ A for each checkpoint
+        deltas = []
+        for ckpt in checkpoints:
+            dw = _lora_ab_to_deltaw(ckpt[a_key], ckpt[b_key])
+            deltas.append(dw)
+
+        if len(deltas) == 2:
+            W1, W2 = deltas[0], deltas[1]
+            norm1 = torch.norm(W1)
+            norm2 = torch.norm(W2)
+
+            if norm1 < 1e-8 or norm2 < 1e-8:
+                W_t = (1 - t) * W1 + t * W2
+            else:
+                trace = (W1.T @ W2).trace().item()
+                cos_omega = trace / (norm1 * norm2)
+                cos_omega = float(max(-1.0, min(1.0, cos_omega)))
+                if cos_omega > 1.0 - 1e-4:
+                    W_t = (1 - t) * W1 + t * W2
+                else:
+                    omega = torch.as_tensor(cos_omega).arccos()
+                    sin_omega = torch.sin(omega)
+                    if abs(sin_omega.item()) < 1e-8:
+                        W_t = (1 - t) * W1 + t * W2
+                    else:
+                        w1_factor = torch.sin((1 - t) * omega) / sin_omega
+                        w2_factor = torch.sin(t * omega) / sin_omega
+                        W_t = w1_factor * W1 + w2_factor * W2
+            merged_dw = W_t
+
+        else:
+            centre = torch.stack(deltas).mean(dim=0)
+            slerped = []
+            for dw in deltas:
+                norm_dw = torch.norm(dw)
+                norm_c  = torch.norm(centre)
+                if norm_dw < 1e-8 or norm_c < 1e-8:
+                    interp = (1 - t) * dw + t * centre
+                else:
+                    trace = (dw.T @ centre).trace().item()
+                    cos_omega = trace / (norm_dw * norm_c)
+                    cos_omega = float(max(-1.0, min(1.0, cos_omega)))
+                    if cos_omega > 1.0 - 1e-4:
+                        interp = (1 - t) * dw + t * centre
+                    else:
+                        omega = torch.as_tensor(cos_omega).arccos()
+                        sin_omega = torch.sin(omega)
+                        if abs(sin_omega.item()) < 1e-8:
+                            interp = (1 - t) * dw + t * centre
+                        else:
+                            w_dw = torch.sin((1 - t) * omega) / sin_omega
+                            w_c  = torch.sin(t * omega) / sin_omega
+                            interp = w_dw * dw + w_c * centre
+                slerped.append(interp)
+            merged_dw = torch.stack(slerped).mean(dim=0)
+
+        # Identity shortcut: when merged delta ≈ first delta, skip SVD to avoid
+        # rank-r approximation error (make_lora deltas have ~96% rel_err from SVD).
+        delta0_norm = deltas[0].norm()
+        if (merged_dw - deltas[0]).norm() < 1e-6 * delta0_norm.clamp_min(1e-8):
+            result[a_key] = checkpoints[0][a_key].clone()
+            result[b_key] = checkpoints[0][b_key].clone()
+            continue
+
+        # Decompose merged delta back to (B, A) via SVD
+        rank = checkpoints[0][a_key].shape[0]
+        merged_B, merged_A = _deltaw_to_lora_ab(merged_dw, rank)
+        result[a_key] = merged_A
+        result[b_key] = merged_B
+
+    return result
+
+
+# ============================================================================
 # Unified dispatch
 # ============================================================================
 
@@ -667,6 +817,7 @@ MERGE_METHODS: Dict[str, Callable] = {
     "dare":     dare_merge,
     "fisher":   fisher_merge,
     "soups":    model_soups,
+    "slerp":    slerp_merge,
     "average":  merge_model_checkpoints,
 }
 

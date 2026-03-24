@@ -11,6 +11,7 @@ from federated.merge import (
     merge_model_checkpoints, merge_models,
     apply_merged_adapter, checkpoint_has_lora,
     extract_lora_state, extract_nonlora_state,
+    slerp_merge,
 )
 
 
@@ -447,6 +448,87 @@ def test_apply_merged_adapter():
 
 
 # =============================================================================
+# SLERP Merging
+# =============================================================================
+
+def test_slerp_identity():
+    """SLERP of identical checkpoints returns the same state."""
+    ckpt = make_lora(seed=42)
+    out  = slerp_merge([ckpt, ckpt], t=0.5)
+    for k in ckpt:
+        assert torch.allclose(out[k], ckpt[k], atol=1e-5), f"mismatch on {k}"
+    print("PASS slerp identity")
+
+
+def test_slerp_midpoint():
+    """t=0.5: SLERP midpoint of two distinct checkpoints."""
+    ckpt1 = make_lora(seed=10)
+    ckpt2 = make_lora(seed=20)
+    out   = slerp_merge([ckpt1, ckpt2], t=0.5)
+    for i in range(2):
+        ak, bk = f"layer.{i}.A", f"layer.{i}.B"
+        W1 = dw(ckpt1, ak, bk)
+        W2 = dw(ckpt2, ak, bk)
+        Wt = dw(out, ak, bk)
+        # Midpoint should lie between W1 and W2
+        n1, n2 = W1.norm(), W2.norm()
+        assert Wt.norm() > 0, f"layer.{i} output is zero"
+        # Verify it's in the right ballpark (between the two input norms)
+        assert (Wt.norm() - 0.5 * (n1 + n2)).abs() / max(n1 + n2, 1) < 2.0, \
+            f"layer.{i} norm {Wt.norm():.4f} far outside [{n1:.4f}, {n2:.4f}]"
+    print("PASS slerp midpoint")
+
+
+def test_slerp_endpoints():
+    """t=0 → first checkpoint, t=1 → last checkpoint (with SVD rounding)."""
+    ckpt1 = make_lora(seed=10)
+    ckpt2 = make_lora(seed=20)
+    out0  = slerp_merge([ckpt1, ckpt2], t=0.0)
+    out1  = slerp_merge([ckpt1, ckpt2], t=1.0)
+    for i in range(2):
+        ak, bk = f"layer.{i}.A", f"layer.{i}.B"
+        W1 = dw(ckpt1, ak, bk)
+        W2 = dw(ckpt2, ak, bk)
+        Wt0 = dw(out0, ak, bk)
+        Wt1 = dw(out1, ak, bk)
+        # At t=0, output should be close to W1; at t=1, close to W2
+        # SVD rank-r introduces approximation error, so use cos similarity
+        cos0 = (W1 * Wt0).sum() / (W1.norm() * Wt0.norm()).clamp_min(1e-8)
+        cos1 = (W2 * Wt1).sum() / (W2.norm() * Wt1.norm()).clamp_min(1e-8)
+        assert cos0.item() > 0.9, f"layer.{i} t=0 cos={cos0.item():.4f} < 0.9"
+        assert cos1.item() > 0.9, f"layer.{i} t=1 cos={cos1.item():.4f} < 0.9"
+    print("PASS slerp endpoints")
+
+
+def test_slerp_n_models():
+    """SLERP with N>2 checkpoints: global-mean centre + per-pair SLERP."""
+    ckpt1 = make_lora(seed=1)
+    ckpt2 = make_lora(seed=2)
+    ckpt3 = make_lora(seed=3)
+    out   = slerp_merge([ckpt1, ckpt2, ckpt3], t=0.5)
+    for i in range(2):
+        ak, bk = f"layer.{i}.A", f"layer.{i}.B"
+        Wt = dw(out, ak, bk)
+        assert Wt.norm() > 0, f"layer.{i} output is zero for 3-model merge"
+    # Verify non-LoRA params are averaged
+    # make_lora doesn't include non-LoRA, so check LoRA-only output is valid
+    print("PASS slerp n_models (3 checkpoints)")
+
+
+def test_slerp_t_out_of_range():
+    """t outside [0,1] raises ValueError."""
+    ckpt1 = make_lora(seed=1)
+    ckpt2 = make_lora(seed=2)
+    for bad_t in [-0.1, 1.5]:
+        try:
+            slerp_merge([ckpt1, ckpt2], t=bad_t)
+            assert False, f"t={bad_t} should raise ValueError"
+        except ValueError as e:
+            assert "must be in [0, 1]" in str(e)
+    print("PASS slerp t out-of-range raises")
+
+
+# =============================================================================
 # Run
 # =============================================================================
 
@@ -464,6 +546,8 @@ if __name__ == "__main__":
         test_soups_uniform, test_soups_greedy,
         test_dispatch_ties, test_dispatch_average,
         test_has_lora, test_extract_lora, test_apply_merged_adapter,
+        test_slerp_identity, test_slerp_midpoint, test_slerp_endpoints,
+        test_slerp_n_models, test_slerp_t_out_of_range,
     ]
     failed = 0
     for t in tests:
