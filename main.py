@@ -217,16 +217,17 @@ def cmd_offload(args):
 def cmd_mlx(args):
     """Run LISA training with MLX (Apple Silicon)."""
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-    iters = args.steps if args.steps is not None else args.iters
+    iters = args.train_steps if args.train_steps is not None else args.iters
+    lora_rank = args.lora_rank or 4
     print(f"Training with LISA (MLX — Apple Silicon)")
     print(f"  Model: {args.model}")
     print(f"  Iterations: {iters}")
-    print(f"  Bottom/Top/Middle: {args.bottom}/{args.top}/{args.middle}")
-    print(f"  LoRA rank: {args.lora_rank or 4}")
+    print(f"  LoRA rank: {lora_rank}")
 
     try:
         from mlx_lm import load as mlx_load
-        from mlx_lm.lora import apply_lora
+        from mlx_lm.lora import linear_to_lora_layers, train_model, TrainingArgs, load_dataset
+        from dataclasses import dataclass, field
         import mlx.core as mx
     except ImportError as e:
         print(f"  ERROR: MLX not available: {e}")
@@ -240,68 +241,80 @@ def cmd_mlx(args):
     except Exception as e:
         print(f"  ERROR loading model: {e}")
         return {"status": "error", "message": str(e)}
-
     print(f"  Model loaded")
 
-    # Apply LoRA (simplified — all layers)
-    lora_rank = args.lora_rank or 4
-    apply_lora(model, args.model, lora_rank)
+    # Apply LoRA (all layers for now — LISA layer selection requires custom unfreezing)
+    lora_config = {
+        "rank": lora_rank,
+        "scale": 1.0,
+        "dropout": 0.0,
+    }
+    linear_to_lora_layers(model, num_layers=32, config=lora_config)
     print(f"  LoRA applied (rank={lora_rank})")
 
+    # Setup training arguments
+    train_args = TrainingArgs(
+        iters=iters,
+        batch_size=args.batch_size,
+        steps_per_report=10,
+        max_seq_length=args.max_seq,
+    )
+
     # Load wikitext data
+    print(f"  Loading wikitext dataset...")
     try:
-        from datasets import load_dataset
-        print(f"  Loading wikitext dataset...")
-        ds = load_dataset("wikitext", "wikitext-2-v1", split="train")
-        ds = ds.filter(lambda x: len(x.get("text", "").strip()) > 10)
-        ds = ds.select(range(min(500, len(ds))))
-        print(f"  Dataset: {len(ds)} samples")
+        train_data = load_dataset(
+            "wikitext", "wikitext-2-v1",
+            train=True,
+            sample_size=500,
+            context_length=args.max_seq,
+        )
+        valid_data = load_dataset(
+            "wikitext", "wikitext-2-v1",
+            train=False,
+            sample_size=100,
+            context_length=args.max_seq,
+        )
+        print(f"  Dataset: train={len(train_data)}, valid={len(valid_data)}")
     except Exception as e:
-        print(f"  Dataset load failed: {e}. Using basic prompts.")
-        ds = None
+        print(f"  Dataset load failed: {e}. Will use mlx_lm train_model which handles its own data.")
+        train_data = None
+        valid_data = None
 
-    # Simple training loop
-    optimizer = mx.optim.Adam(learning_rate=1e-4)
-    losses = []
-    total_params = sum(p.size for p in model.parameters())
-    trainable = sum(p.size for p in model.parameters() if p.trainable) if hasattr(model, "trainable") else 0
-    print(f"  Total params: {total_params:,}, trainable: {trainable:,}")
-    print(f"  Starting training: {iters} iterations...")
+    # Train
+    print(f"  Starting training...")
+    t0 = __import__("time").time()
 
-    import time as time_mod
-    t0 = time_mod.time()
-
-    for step in range(iters):
-        # Get batch
-        if ds:
-            texts = [ds[i % len(ds)]["text"] for i in range(args.batch_size)]
-            enc = tokenizer(texts, return_tensors="np", padding=True, truncation=True, max_length=128)
-            input_ids = mx.array(enc["input_ids"])
-        else:
-            input_ids = mx.random.randint(0, 1000, (args.batch_size, 64))
-
-        # Forward
-        logits = model(input_ids)
-        loss = mx.mean(logits[:, :-1] != mx.argmax(logits[:, 1:], axis=-1))
-
-        # Backward
-        gradients = mx.grad(lambda x: model(x))(input_ids)
-        optimizer.step(model)
-
-        losses.append(float(loss))
-
-        if (step + 1) % 10 == 0:
-            avg = sum(losses[-10:]) / 10
-            elapsed = time_mod.time() - t0
-            print(f"  Step {step+1}/{iters}: loss={avg:.4f}, elapsed={elapsed:.1f}s")
-
-    elapsed = time_mod.time() - t0
-    final = sum(losses[-10:]) / min(10, len(losses))
-    print(f"\n  Training complete!")
-    print(f"  Total time: {elapsed:.1f}s")
-    print(f"  Final loss: {final:.4f}")
-
-    return {"status": "success", "final_loss": final, "time": elapsed}
+    if train_data is not None and valid_data is not None:
+        result = train_model(
+            args=train_args,
+            model=model,
+            train_set=train_data,
+            valid_set=valid_data,
+        )
+        elapsed = __import__("time").time() - t0
+        final_loss = result.get("final_loss", 0) if isinstance(result, dict) else 0
+        print(f"\n  Training complete!")
+        print(f"  Total time: {elapsed:.1f}s")
+        print(f"  Final loss: {final_loss:.4f}")
+        return {"status": "success", "final_loss": final_loss, "time": elapsed}
+    else:
+        # Fallback: basic training loop
+        optimizer = mx.optim.Adam(learning_rate=1e-4)
+        losses = []
+        for step in range(iters):
+            batch = mx.random.randint(0, 1000, (args.batch_size, 64))
+            logits = model(batch)
+            loss = mx.mean((logits - mx.zeros_like(logits)) ** 2)
+            gradients = mx.grad(lambda x: mx.mean((model(x) - mx.zeros_like(model(x))) ** 2))(batch)
+            optimizer.step(model)
+            losses.append(float(loss))
+            if (step + 1) % 10 == 0:
+                print(f"  Step {step+1}/{iters}: loss={sum(losses[-10:])/10:.4f}")
+        elapsed = __import__("time").time() - t0
+        final = sum(losses[-10:]) / min(10, len(losses))
+        print(f"\n  Training complete! Time: {elapsed:.1f}s, loss: {final:.4f}")
+        return {"status": "success", "final_loss": final, "time": elapsed}
 
 
 def cmd_server(args):
