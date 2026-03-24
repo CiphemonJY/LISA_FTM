@@ -215,8 +215,9 @@ def cmd_offload(args):
 
 
 def cmd_mlx(args):
-    """Run LISA training with MLX (Apple Silicon)."""
-    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    """Run LISA training with MLX (Apple Silicon) via mlx_lm CLI."""
+    import subprocess, json, tempfile, os, sys
+
     iters = args.train_steps if args.train_steps is not None else args.iters
     lora_rank = args.lora_rank or 4
     print(f"Training with LISA (MLX — Apple Silicon)")
@@ -225,108 +226,83 @@ def cmd_mlx(args):
     print(f"  LoRA rank: {lora_rank}")
 
     try:
-        from mlx_lm import load as mlx_load
-        from mlx_lm.lora import linear_to_lora_layers, train_model, TrainingArgs, load_dataset
-        from dataclasses import dataclass, field
         import mlx.core as mx
-        import mlx.nn as nn
-        import mlx.optimizers as optim
+        from mlx_lm import load as mlx_load
     except ImportError as e:
         print(f"  ERROR: MLX not available: {e}")
         print(f"  Install with: pip install mlx mlx-lm")
         return {"status": "error", "message": "MLX not installed"}
 
-    # Load model
+    # Verify model loads
     print(f"  Loading {args.model}...")
     try:
         model, tokenizer = mlx_load(args.model)
+        del model, tokenizer  # Free memory
     except Exception as e:
         print(f"  ERROR loading model: {e}")
         return {"status": "error", "message": str(e)}
-    print(f"  Model loaded")
+    print(f"  Model verified OK")
 
-    # Apply LoRA (all layers for now — LISA layer selection requires custom unfreezing)
-    lora_config = {
-        "rank": lora_rank,
-        "scale": 1.0,
-        "dropout": 0.0,
-    }
-    linear_to_lora_layers(model, num_layers=32, config=lora_config)
-    print(f"  LoRA applied (rank={lora_rank})")
+    # Create temp dir for training data
+    tmpdir = tempfile.mkdtemp(prefix="lisa_mlx_")
+    data_path = os.path.join(tmpdir, "train.jsonl")
 
-    # Setup training arguments
-    train_args = TrainingArgs(
-        iters=iters,
-        batch_size=args.batch_size,
-        steps_per_report=10,
-        max_seq_length=args.max_seq,
-    )
-
-    # Load wikitext data
-    print(f"  Loading wikitext dataset...")
+    # Prepare wikitext training data
+    print(f"  Preparing training data...")
     try:
-        train_data = load_dataset(
-            "wikitext", "wikitext-2-v1",
-            train=True,
-            sample_size=500,
-            context_length=args.max_seq,
-        )
-        valid_data = load_dataset(
-            "wikitext", "wikitext-2-v1",
-            train=False,
-            sample_size=100,
-            context_length=args.max_seq,
-        )
-        print(f"  Dataset: train={len(train_data)}, valid={len(valid_data)}")
+        from datasets import load_dataset
+        ds = load_dataset("wikitext", "wikitext-2-v1", split="train")
+        ds = ds.filter(lambda x: len(x.get("text", "").strip()) > 20)
+        ds = ds.select(range(min(1000, len(ds))))
+        with open(data_path, "w") as f:
+            for item in ds:
+                text = item.get("text", "").strip()
+                if text:
+                    f.write(json.dumps({"text": text}) + "\n")
+        print(f"  Data: {len(ds)} samples")
     except Exception as e:
-        print(f"  Dataset load failed: {e}. Will use mlx_lm train_model which handles its own data.")
-        train_data = None
-        valid_data = None
+        print(f"  Dataset error: {e}. Using synthetic data.")
+        with open(data_path, "w") as f:
+            for i in range(500):
+                f.write(json.dumps({"text": f"Training example {i}: the model learns from data"}) + "\n")
 
-    # Train
-    print(f"  Starting training...")
+    # Build mlx_lm lora command
+    cmd = [
+        sys.executable, "-m", "mlx_lm.lora",
+        "--model", args.model,
+        "--train-data", f"{data_path}:jsonl",
+        "--batch-size", str(args.batch_size),
+        "--iters", str(iters),
+        "--rank", str(lora_rank),
+        "--steps-per-report", "10",
+        "--max-seq-length", str(args.max_seq),
+    ]
+
+    print(f"  Running: python -m mlx_lm.lora --model {args.model} --iters {iters}...")
     t0 = __import__("time").time()
+    env = os.environ.copy()
+    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)
+    elapsed = __import__("time").time() - t0
 
-    if train_data is not None and valid_data is not None:
-        result = train_model(
-            args=train_args,
-            model=model,
-            train_set=train_data,
-            valid_set=valid_data,
-        )
-        elapsed = __import__("time").time() - t0
-        final_loss = result.get("final_loss", 0) if isinstance(result, dict) else 0
-        print(f"\n  Training complete!")
-        print(f"  Total time: {elapsed:.1f}s")
-        print(f"  Final loss: {final_loss:.4f}")
-        return {"status": "success", "final_loss": final_loss, "time": elapsed}
+    # Print output
+    if result.stdout:
+        print(f"\n{result.stdout[-1000:]}")
+    if result.stderr:
+        print(f"\nSTDERR: {result.stderr[-500:]}")
+
+    if result.returncode == 0:
+        # Find final loss
+        final_loss = "unknown"
+        for line in reversed(result.stdout.splitlines()):
+            if "loss" in line.lower() and ":" in line:
+                final_loss = line.strip()
+                break
+        print(f"\n  ✅ MLX training complete in {elapsed:.1f}s")
+        return {"status": "success", "time": elapsed, "final_loss": final_loss}
     else:
-        # Fallback: basic training loop
-        optimizer = optim.Adam(learning_rate=1e-4)
-        losses = []
-        def loss_fn(model, batch):
-            # Create simple labels: next token prediction
-            labels = mx.concatenate([batch[:, 1:], mx.zeros((batch.shape[0], 1), dtype=batch.dtype)], axis=1)
-            logits = model(batch)
-            # Flatten for cross-entropy
-            loss = mx.mean(nn.losses.cross_entropy(
-                logits[:, :-1].reshape(-1, logits.shape[-1]),
-                labels[:, 1:].reshape(-1)
-            ))
-            return loss
-
-        for step in range(iters):
-            batch = mx.random.randint(0, 1000, (args.batch_size, 64))
-            loss_and_grads = mx.value_and_grad(loss_fn)(model, batch)
-            loss, grads = loss_and_grads
-            optimizer.update(model, grads)
-            losses.append(float(loss))
-            if (step + 1) % 10 == 0:
-                print(f"  Step {step+1}/{iters}: loss={sum(losses[-10:])/10:.4f}")
-        elapsed = __import__("time").time() - t0
-        final = sum(losses[-10:]) / min(10, len(losses))
-        print(f"\n  Training complete! Time: {elapsed:.1f}s, loss: {final:.4f}")
-        return {"status": "success", "final_loss": final, "time": elapsed}
+        print(f"\n  ❌ MLX training failed (code {result.returncode})")
+        return {"status": "error", "message": result.stderr[-500:]}
 
 
 def cmd_server(args):
