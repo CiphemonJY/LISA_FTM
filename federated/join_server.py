@@ -37,6 +37,62 @@ def apply_lora_to_model(model, rank=4, alpha=8.0, dropout=0.05):
 
 # ============ Join Code System ============
 JOIN_CODES = {}  # code -> {server_url, model_name, created_at}
+ngrok_tunnel_url = None  # Global for ngrok URL
+
+def start_ngrok_tunnel(port, auth_token=None):
+    """
+    Start ngrok tunnel to expose server publicly.
+    Returns the public URL if successful, None otherwise.
+    """
+    import subprocess
+    import json
+    import time
+    
+    # Check if ngrok is installed
+    try:
+        result = subprocess.run(["ngrok", "--version"], capture_output=True, text=True)
+        logger.info(f"ngrok found: {result.stdout.strip()}")
+    except FileNotFoundError:
+        logger.warning("ngrok not installed. Install with: brew install ngrok")
+        logger.warning("Or download from: https://ngrok.com/download")
+        return None
+    
+    # Start ngrok tunnel
+    cmd = ["ngrok", "http", str(port), "--log", "stdout"]
+    if auth_token:
+        cmd.extend(["--authtoken", auth_token])
+    
+    try:
+        # Start ngrok in background
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        
+        # Wait for tunnel to establish (look for URL in output)
+        public_url = None
+        for _ in range(60):  # 30 second timeout
+            line = proc.stdout.readline()
+            if line:
+                logger.info(f"ngrok: {line.strip()}")
+                # Look for the public URL
+                if "https://" in line and ".ngrok.io" in line:
+                    # Extract URL
+                    import re
+                    match = re.search(r'https://[a-z0-9]+\.ngrok\.io', line)
+                    if match:
+                        public_url = match.group(0)
+                        break
+            time.sleep(0.5)
+        
+        if public_url:
+            logger.info(f"🌐 ngrok tunnel established: {public_url}")
+            return public_url
+        else:
+            logger.warning("ngrok started but couldn't get public URL")
+            proc.terminate()
+            return None
+            
+    except Exception as e:
+        logger.error(f"ngrok error: {e}")
+        return None
 
 def generate_join_code(server_url="http://localhost:8080", model_name="Qwen/Qwen2.5-0.5B"):
     """
@@ -247,6 +303,16 @@ async def join_page(code: str):
     """Web page to join the federated network."""
     config = get_join_config(code.upper())
     
+    # Build the page based on whether we have ngrok URL
+    ngrok_section = ""
+    if ngrok_tunnel_url and ngrok_tunnel_url.startswith("https://"):
+        ngrok_section = f'''
+            <p style="color: #00ff88; font-size: 18px; margin: 20px 0;">
+                🌐 <strong>Public URL (worldwide access):</strong><br>
+                <a href="{ngrok_tunnel_url}/join/{code.upper()}" style="font-size: 14px;">{ngrok_tunnel_url}/join/{code.upper()}</a>
+            </p>
+        '''
+    
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -277,6 +343,8 @@ async def join_page(code: str):
             <p class="subtitle">Join the distributed AI training network</p>
             
             <div class="code">{code.upper()}</div>
+            
+            {ngrok_section}
             
             <p>Your join code is ready! Run this on any device:</p>
             
@@ -342,23 +410,44 @@ def main():
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--generate-code", action="store_true", help="Generate a join code")
+    parser.add_argument("--ngrok", action="store_true", help="Expose server via ngrok for cross-network access")
+    parser.add_argument("--ngrok-token", type=str, default=None, help="ngrok auth token for custom subdomains")
     args = parser.parse_args()
     
     global server
+    global ngrok_tunnel_url
+    
     server = FederatedServer(args.model, args.checkpoint_dir, args.lr)
     
     # Generate join code if requested
     if args.generate_code:
-        # Try to determine public URL
-        public_url = f"http://localhost:{args.port}"
+        public_url = None
+        
+        # Try ngrok if requested
+        if args.ngrok:
+            public_url = start_ngrok_tunnel(args.port, args.ngrok_token)
+            if public_url:
+                logger.info(f"ngrok tunnel active: {public_url}")
+        
+        # Fall back to localhost if no tunnel
+        if public_url is None:
+            public_url = f"http://localhost:{args.port}"
+        
         code = generate_join_code(public_url, args.model)
+        ngrok_tunnel_url = public_url if public_url.startswith("http") else None
+        
         print(f"\n{'='*50}")
         print(f"🎉 JOIN CODE READY!")
         print(f"{'='*50}")
         print(f"\n  Code: {code}")
-        print(f"  URL:  http://YOUR_IP:{args.port}/join/{code}")
-        print(f"\n  Share this code to let others join!")
-        print(f"\n  Or visit: http://localhost:{args.port}/join/{code}")
+        
+        if ngrok_tunnel_url and ngrok_tunnel_url != f"http://localhost:{args.port}":
+            print(f"  🌐 Public: {ngrok_tunnel_url}/join/{code}")
+            print(f"\n  Share this URL for WORLDWIDE access!")
+        else:
+            print(f"  URL:  http://YOUR_IP:{args.port}/join/{code}")
+        
+        print(f"\n  Local only: http://localhost:{args.port}/join/{code}")
         print(f"{'='*50}\n")
     
     logger.info(f"Starting LISA server on port {args.port}")
