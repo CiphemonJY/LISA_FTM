@@ -438,11 +438,20 @@ class FederatedServer:
         logger.info(f"Round {round_num} complete - {len(aggregated)} keys updated")
         self._save_checkpoint(round_num)
         
-    def _save_checkpoint(self, round_num):
+    def _save_checkpoint(self, round_num, keep=3):
+        """Save checkpoint with rotation (keep last N)."""
         path = os.path.join(self.checkpoint_dir, f"model_round_{round_num}.pt")
         state = {k: v.cpu() for k, v in self.model.state_dict().items()}
         torch.save(state, path)
         logger.info(f"Saved: {path}")
+        
+        # Rotate: keep only last N checkpoints
+        checkpoints = sorted([f for f in os.listdir(self.checkpoint_dir) if f.startswith("model_round_") and f.endswith(".pt")])
+        while len(checkpoints) > keep:
+            old = checkpoints.pop(0)
+            old_path = os.path.join(self.checkpoint_dir, old)
+            os.remove(old_path)
+            logger.info(f"Rotated out: {old}")
         
     def receive_gradient(self, data: Dict) -> Dict:
         client_id = data.get("client_id", "unknown")
