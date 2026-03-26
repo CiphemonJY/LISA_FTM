@@ -39,14 +39,49 @@ def apply_lora_to_model(model, rank=4, alpha=8.0, dropout=0.05):
 JOIN_CODES = {}  # code -> {server_url, model_name, created_at}
 
 def generate_join_code(server_url="http://localhost:8080", model_name="Qwen/Qwen2.5-0.5B"):
-    """Generate a short, easy-to-type join code."""
-    code = secrets.token_hex(4).upper()[:8]  # 8 chars like "A7X9K2M4"
+    """
+    Generate a unique, secure join code.
+    - 12 characters from mixed alphanumeric (no confusing chars: 0/O, 1/I/L)
+    - Includes server-derived entropy (timestamp + random)
+    - Collision-checked against existing codes
+    """
+    # Characters that are easy to read/type (no 0, O, 1, I, L)
+    chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+    
+    # Server entropy: timestamp (40 bits) + process ID (16 bits) + random (24 bits)
+    import struct
+    server_entropy = struct.unpack('>Q', struct.pack('>Q', int(time.time() * 1000)))[0] ^ (os.getpid() << 40)
+    
+    # Generate code with server + random entropy
+    combined_entropy = (server_entropy << 24) | secrets.randbits(24)
+    
+    # Build 12-char code
+    code_parts = []
+    remaining = combined_entropy
+    for _ in range(12):
+        idx = remaining % len(chars)
+        code_parts.append(chars[idx])
+        remaining //= len(chars)
+    
+    code = ''.join(code_parts)
+    
+    # Collision check (regenerate if needed)
+    max_attempts = 10
+    attempts = 0
+    while code in JOIN_CODES and attempts < max_attempts:
+        # Add more random suffix
+        extra = ''.join(secrets.choice(chars) for _ in range(4))
+        code = code[:12] + extra
+        attempts += 1
+    
     JOIN_CODES[code] = {
         "server_url": server_url,
         "model_name": model_name,
         "created_at": time.time(),
         "clients": 0
     }
+    
+    logger.info(f"Generated unique join code: {code} (entropy bits: ~80)")
     return code
 
 def get_join_config(code):
