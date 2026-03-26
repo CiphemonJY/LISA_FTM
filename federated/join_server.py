@@ -163,6 +163,7 @@ class RoundState:
     round_num: int
     status: str = "waiting"
     gradients: dict = None
+    required_gradients: int = 3  # Default: 3 clients per round
     def __post_init__(self):
         self.gradients = self.gradients or {}
 
@@ -196,8 +197,18 @@ class FederatedServer:
         with self.lock:
             if round_number not in self.rounds:
                 self.rounds[round_number] = RoundState(round_number)
+            
+            # Don't accept gradients for completed rounds
+            if self.rounds[round_number].status == "complete":
+                return {
+                    "status": "round_complete",
+                    "round": round_number,
+                    "gradients_received": len(self.rounds[round_number].gradients)
+                }
+            
             self.rounds[round_number].gradients[client_id] = state_dict
-            self.rounds[round_number].status = "collecting"
+            if self.rounds[round_number].status != "aggregating":
+                self.rounds[round_number].status = "collecting"
             self.stats["total_gradients"] += 1
             self.stats["total_clients"].add(client_id)
         
@@ -380,10 +391,18 @@ class FederatedServer:
             if round_num not in self.rounds:
                 return
             state = self.rounds[round_num]
-            if state.status == "aggregating":
+            if state.status == "aggregating" or state.status == "complete":
                 return
-            state.status = "aggregating"
+            
             gradients = list(state.gradients.values())
+            
+            # Check if we have enough gradients
+            if len(gradients) < state.required_gradients:
+                logger.info(f"Round {round_num}: {len(gradients)}/{state.required_gradients} gradients, waiting...")
+                state.status = "collecting"
+                return
+            
+            state.status = "aggregating"
         
         logger.info(f"Aggregating round {round_num} with {len(gradients)} gradients")
         

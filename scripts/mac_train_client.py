@@ -57,7 +57,7 @@ def load_model():
     log(f"Model ready: {sum(p.numel() for p in model.parameters()):,} params")
     return model, tokenizer
 
-def train_client(model, tokenizer, client_id, steps=10):
+def train_client(model, tokenizer, client_id, round_num, steps=10):
     """Train and submit gradient."""
     log(f"  Training {client_id} ({steps} steps)...")
     
@@ -103,7 +103,7 @@ def train_client(model, tokenizer, client_id, steps=10):
     
     payload = {
         "client_id": client_id,
-        "round_number": 1,  # Always round 1 for now
+        "round_number": round_num,  # Use actual round
         "gradient_data": encoded,
         "compression_info": {"method": "none"}
     }
@@ -112,6 +112,12 @@ def train_client(model, tokenizer, client_id, steps=10):
         r = requests.post(f"{SERVER_URL}/submit", json=payload, timeout=60)
         result = r.json()
         log(f"    ✅ Submitted: {result}")
+        
+        # If round is complete, other clients can move on
+        if result.get("status") == "round_complete":
+            log(f"    ℹ️ Round {round_num} already complete, will advance")
+            return "round_complete"
+        
         return True
     except Exception as e:
         log(f"    ❌ Error: {e}")
@@ -202,8 +208,11 @@ def main():
         # Train 3 clients
         for i in range(1, 4):
             client_id = f"mac_r{round_num}_c{i}"
-            success = train_client(model, tokenizer, client_id, steps=10)
-            if success:
+            success = train_client(model, tokenizer, client_id, round_num, steps=10)
+            if success == "round_complete":
+                log(f"  ℹ️ Round {round_num} completed by earlier client")
+                break  # Move to next round
+            elif success:
                 log(f"  ✅ {client_id}")
             else:
                 log(f"  ❌ {client_id} failed")
