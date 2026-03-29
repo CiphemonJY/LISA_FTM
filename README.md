@@ -62,26 +62,25 @@ packed, meta, stats = compressor.compress(gradients)
 
 ## Quick Start
 
-### 1. Install dependencies
+**New to LISA?** Start with the [Quick Start Guide](docs/QUICKSTART.md).
+
+### TL;DR - Train a 7B Model Now
+
 ```bash
-pip install torch transformers datasets huggingface_hub numpy \
-  cryptography requests psutil pyyaml fastapi uvicorn pytest
+# 1. Install dependencies
+pip install torch transformers peft huggingface_hub accelerate
+
+# 2. Clone and run
+git clone https://github.com/CiphemonJY/LISA_FTM.git
+cd LISA_FTM
+python3 train_7b_simple.py --steps 100
 ```
 
-### 2. Start the server
-```bash
-python -m federated.server --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --rounds 3 --port 8080
-```
+### Hardware-Specific Setup
 
-### 3. Run a client (same machine or another device)
-```bash
-python fed_client.py --host 127.0.0.1 --port 8080
-```
-
-### Or run locally without a server
-```bash
-python main.py --mode train --model EleutherAI/pythia-70m --steps 100
-```
+- [Jetson Setup Guide](docs/JETSON_SETUP.md) - NVIDIA Jetson Orin
+- [Mac Setup Guide](docs/MAC_SETUP.md) - Apple Silicon
+- [Linux Setup Guide](docs/LINUX_SETUP.md) - Ubuntu/Desktop
 
 ---
 
