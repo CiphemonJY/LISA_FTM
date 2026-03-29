@@ -2,7 +2,7 @@
 
 **Technical Report v1.0**
 *Date: March 29, 2026*
-*Authors: Ciphemon + James*
+*Authors: Anonymous contributors*
 
 ---
 
