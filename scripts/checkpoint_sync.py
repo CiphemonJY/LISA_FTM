@@ -6,9 +6,9 @@ After each training round, sync the latest checkpoint with the other device
 import os, sys, time, subprocess, hashlib
 from datetime import datetime
 
-# Config
-JETSON_IP = "10.0.0.145"
-JETSON_USER = "jetson"
+# Config - Use environment variables for sensitive info
+JETSON_IP = os.environ.get("JETSON_IP", "10.0.0.145")  # Set JETSON_IP env var
+JETSON_USER = os.environ.get("JETSON_USER", "jetson")  # Set JETSON_USER env var
 MAC_CHECKPOINT_DIR = "/tmp/lisa_standalone_checkpoints"
 JETSON_CHECKPOINT_DIR = "/tmp/lisa_jetson_checkpoints"
 LOG_FILE = "/tmp/lisa_sync.log"

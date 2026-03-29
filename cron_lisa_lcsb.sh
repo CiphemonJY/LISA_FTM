@@ -3,7 +3,7 @@
 # Runs every 15 minutes
 
 LOG="/tmp/lisa_lcsb_cron.log"
-SSH="ssh jetson@10.0.0.145"
+SSH="ssh jetson@${JETSON_IP:-10.0.0.145}"
 
 echo "=== $(date) ===" >> $LOG
 

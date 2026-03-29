@@ -1,7 +1,7 @@
 # LISA_FTM Real Benchmark Results — Mac Mini M4 Pro
 
 **Date:** 2026-03-24
-**Run by:** Subagent on Mac Mini M4 Pro (JYbot's Mac mini)
+**Run by:** Subagent on Mac Mini M4 Pro (Machine)
 
 ---
 
