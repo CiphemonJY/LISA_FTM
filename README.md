@@ -36,6 +36,20 @@ packed, meta, stats = compressor.compress(gradients)
 
 ---
 
+## 🚀 Breakthrough: 32B Training on 7.4GB RAM
+
+**NEW (2026-03-30):** Layer-by-layer LISA enables 32B model training on constrained hardware!
+
+See [LISA_LAYER_BY_LAYER_32B.md](LISA_LAYER_BY_LAYER_32B.md) for full details.
+
+```
+Memory usage: 1.04GB (vs 32GB+ traditional)
+Training: 64 layers processed one group at a time
+Hardware: Jetson Orin with 7.4GB RAM
+```
+
+---
+
 ## What It Does
 
 ```
