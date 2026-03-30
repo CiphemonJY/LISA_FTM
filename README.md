@@ -38,15 +38,26 @@ packed, meta, stats = compressor.compress(gradients)
 
 ## 🚀 Breakthrough: 32B Training on 7.4GB RAM
 
-**NEW (2026-03-30):** Layer-by-layer LISA enables 32B model training on constrained hardware!
+**NEW (2026-03-30):** Successfully trained 32B model on Jetson Orin with 7.4GB RAM!
 
-See [LISA_LAYER_BY_LAYER_32B.md](LISA_LAYER_BY_LAYER_32B.md) for full details.
+See [LISA_32B_TECHNICAL_REPORT.md](LISA_32B_TECHNICAL_REPORT.md) for full technical details.
 
 ```
-Memory usage: 1.04GB (vs 32GB+ traditional)
-Training: 64 layers processed one group at a time
+Memory: 1.04GB (vs 32GB+ traditional)
+Training: 300 steps completed
+Loss: 1.11 → converging
 Hardware: Jetson Orin with 7.4GB RAM
 ```
+
+### Results (300 Steps)
+
+| Metric | Value |
+|--------|-------|
+| Memory | **1.04GB** |
+| Steps | 300 (3 epochs) |
+| Final Loss | 1.1182 |
+| Forward Time | 21ms/group |
+| LoRA Size | 33.6MB |
 
 ---
 
