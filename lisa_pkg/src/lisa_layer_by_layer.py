@@ -277,7 +277,7 @@ class LISATrainer:
         # Create dummy hidden states (real impl would extract embeddings)
         hidden_size = self.layer_model.config.hidden_size
         seq_len = input_ids.shape[1]
-        hidden_states = torch.randn(1, seq_len, hidden_size, device=self.device, dtype=torch.float16)
+        hidden_states = torch.randn(1, seq_len, hidden_size, device=self.device, dtype=torch.float16, requires_grad=True)
         
         # Process specified layers (or sample random layers)
         if layer_indices is None:
@@ -291,7 +291,7 @@ class LISATrainer:
             hidden_states = self.layer_model.process_single_layer(layer_idx, hidden_states)
             
             # Compute "loss" against dummy target
-            target = torch.randn_like(hidden_states)
+            target = torch.randn_like(hidden_states).detach().requires_grad_(True)
             loss = nn.functional.mse_loss(hidden_states, target)
             total_loss += loss.item()
             
