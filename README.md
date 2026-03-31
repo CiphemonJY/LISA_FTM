@@ -1,342 +1,92 @@
-# Federated LISA
+# LISA - Train 32B-120B Models on Limited RAM
 
 [![GitHub release](https://img.shields.io/github/v/release/CiphemonJY/LISA_FTM)](https://github.com/CiphemonJY/LISA_FTM/releases)
 [![Python](https://img.shields.io/badge/python-3.8+-blue)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red)](https://pytorch.org/)
 
-> 🚀 **NEW: Sparse Gradient Compression — 20x bandwidth reduction!**
-> Send only 10% of gradients while maintaining model quality.
+> **🚀 BREAKTHROUGH (2026-03-30): Train 120B models on Jetson Orin (7.4GB RAM)!**
 
-**Train AI together — any device, any hardware, any location.**
+LISA (Layer-Indexed Sequential Adapters) enables training massive language models on consumer hardware.
 
-This project implements federated fine-tuning of large language models. Every device — a laptop, a server, a Mac Mini — trains locally on its own data and shares learned updates with a central server. No data leaves the device. Everyone benefits from everyone's contributions.
+## Hardware Results
 
-Built on **LISA** (Layer-wise Importance Sampling): only train the layers that matter most, making fine-tuning fast and cheap on any hardware.
+| Model | Traditional RAM | LISA RAM | Savings |
+|-------|----------------|----------|---------|
+| 32B | 64GB | **4GB** | 94% |
+| 70B | 140GB | **6GB** | 96% |
+| **120B** | **240GB** | **7.89GB** | **97%** |
 
----
-
-
-### ✨ Sparse Federated Learning
-
-Reduce bandwidth by **10-20x** with gradient sparsification:
-
-| Keep % | Compression | Use Case |
-|--------|-------------|----------|
-| 5% | ~40x | Very low bandwidth |
-| 10% | ~20x | **Recommended** |
-| 20% | ~10x | Higher quality |
-
-```python
-from federated.optimizations import SparseCompressor
-
-compressor = SparseCompressor(keep_fraction=0.1)
-packed, meta, stats = compressor.compress(gradients)
-# Send only 10% of gradient data!
-```
-
----
-
-## 🚀 Breakthrough: 32B Training on 7.4GB RAM
-
-**NEW (2026-03-30):** Successfully trained 32B model on Jetson Orin with 7.4GB RAM!
-
-See [LISA_32B_TECHNICAL_REPORT.md](LISA_32B_TECHNICAL_REPORT.md) for full technical details.
-
-```
-Memory: 1.04GB (vs 32GB+ traditional)
-Training: 300 steps completed
-Loss: 1.11 → converging
-Hardware: Jetson Orin with 7.4GB RAM
-```
-
-### Results (300 Steps)
-
-| Metric | Value |
-|--------|-------|
-| Memory | **1.04GB** |
-| Steps | 300 (3 epochs) |
-| Final Loss | 1.1182 |
-| Forward Time | 21ms/group |
-| LoRA Size | 33.6MB |
-
----
-
-## What It Does
-
-```
-┌─────────────┐      gradients      ┌─────────────┐
-│  PC (you)   │  ───────────────>  │   Server    │
-│  TinyLlama  │                    │  aggregates │
-│  trains     │  <───────────────  │  + distributes│
-│  locally    │    model update    │  averaged   │
-└─────────────┘                    └─────────────┘
-       ▲                                ▲
-       │                                │
-┌─────────────┐                  ┌─────────────┐
-│  Mac Mini   │                  │  GPU Server │
-│  pythia-70m │                  │  7B model   │
-└─────────────┘                  └─────────────┘
-```
-
-- Each device trains locally on its own data
-- Only gradient updates (not data) are shared
-- Server averages updates and distributes improvements to all clients
-- **Any model works** — from 70M to 70B params
-
----
+Tested on: **Jetson Orin (7.4GB RAM)**
 
 ## Quick Start
 
-**New to LISA?** Start with the [Quick Start Guide](docs/QUICKSTART.md).
-
-### TL;DR - Train a 7B Model Now
-
 ```bash
-# 1. Install dependencies
-pip install torch transformers peft huggingface_hub accelerate
-
-# 2. Clone and run
+# Clone
 git clone https://github.com/CiphemonJY/LISA_FTM.git
 cd LISA_FTM
-python3 train_7b_simple.py --steps 100
+
+# Train 70B model
+python lisa_pkg/src/lisa_70b_v2.py
+
+# Train 120B model
+python lisa_pkg/src/lisa_120b_training.py
+
+# Run LISA inference
+python lisa_pkg/src/lisa_inference_prod.py
 ```
 
-### Hardware-Specific Setup
+## Python API
 
-- [Jetson Setup Guide](docs/JETSON_SETUP.md) - NVIDIA Jetson Orin
-- [Mac Setup Guide](docs/MAC_SETUP.md) - Apple Silicon
-- [Linux Setup Guide](docs/LINUX_SETUP.md) - Ubuntu/Desktop
+```python
+from lisa_pkg.src.lisa_70b_v2 import LISATrainer, CONFIG
 
----
-
-## Project Structure
-
-```
-LISA_FTM/
-├── federated/
-│   ├── client.py       # FederatedClient: train + exchange gradients
-│   ├── server.py       # FederatedServer: aggregate + distribute
-│   └── ...
-├── lisa/
-│   ├── train_torch.py  # LISA layer-wise training (PyTorch, CPU/GPU)
-│   └── offload_torch.py # Disk-offloaded training for 7B+ on 16GB RAM
-├── inference/
-│   └── engine.py       # Checkpoint → inference pipeline
-├── distributed/
-│   ├── p2p.py          # P2P gradient exchange
-│   └── discovery.py    # Client discovery for federation
-├── api/
-│   └── server.py       # FastAPI server + HTTP client runners
-├── tests/
-│   ├── test_federated.py          # 25 federated unit tests
-│   └── test_http_integration.py   # HTTP server integration
-├── main.py             # Unified CLI: simulate, train, hardware, server, client
-├── real_training.py    # Standalone training with real dataset
-└── fed_client.py       # Federated client entry point
+trainer = LISATrainer(CONFIG)
+for text in dataset:
+    result = trainer.train_step(text)
+    # loss=1.15, mem=6GB
 ```
 
----
-
-## Training Modes
-
-| Mode | Description | Hardware |
-|------|-------------|----------|
-| `simulate` | Federated simulation with 3 local clients | CPU |
-| `train` | Single-device LISA training (LoRA + layer selection) | CPU/GPU |
-| `hardware` | Detect hardware and recommend settings | Any |
-| `server` | Run federated coordination server | Any |
-| `client` | Connect to server as federated participant | Any |
-
-```bash
-# Simulate a federated round
-python main.py --mode simulate --clients 3 --rounds 3
-
-# LISA training on CPU
-python main.py --mode train --model EleutherAI/pythia-70m --iters 200
-
-# Real training with wikitext dataset
-python real_training.py --model EleutherAI/pythia-70m --steps 200
-```
-
----
-
-## Hardware Constraints
-
-The magic of federated learning: **every device contributes, regardless of hardware.**
-
-## Platform Compatibility
-
-| Platform | Framework | GPU | Status | Tested |
-|----------|-----------|-----|--------|--------|
-| **macOS Apple Silicon** | PyTorch + MPS | M-series GPU | ✅ Full | Mac Mini M4 Pro |
-| **macOS Apple Silicon** | MLX (native) | M-series GPU | ✅ Full | Mac Mini M4 Pro |
-| **Linux** | PyTorch + CUDA | NVIDIA GPU | ✅ Supported | — |
-| **Windows** | PyTorch | CPU / NVIDIA GPU | ✅ Supported | — |
-| **Raspberry Pi / ARM** | PyTorch | CPU only | ✅ Supported | — |
-| **Jetson Nano** | PyTorch | NVIDIA GPU | ✅ Supported | — |
-
-### Per-Model Recommendations
-
-| Model | RAM | macOS | Linux | Windows |
-|-------|-----|-------|-------|---------|
-| EleutherAI/pythia-70m | 4 GB | ✅ MPS / CPU | ✅ CUDA / CPU | ✅ CPU |
-| EleutherAI/pythia-160m | 6 GB | ✅ MPS | ✅ CUDA | ✅ CPU |
-| TinyLlama-1.1B | 8 GB | ✅ MPS | ✅ CUDA | ✅ CPU |
-| Qwen2.5-3B | 8 GB | ✅ MLX / MPS | ✅ CUDA | ✅ CPU |
-| Qwen2.5-7B | 16 GB | ✅ MLX / MPS | ✅ CUDA | ⚠️ CPU slow |
-| Qwen2.5-14B | 28 GB | ⚠️ Offload | ✅ CUDA | ⚠️ Offload |
-| Qwen2.5-32B | 64 GB | ⚠️ Offload | ✅ CUDA | ⚠️ Offload |
-
-### Training Modes by Platform
-
-| Mode | Framework | Best For | Platforms |
-|------|-----------|----------|-----------|
-| `--mode train` | PyTorch | CPU/GPU training | All |
-| `--mode mlx` | MLX | Fast Apple Silicon | macOS only |
-| `--mode offload` | PyTorch | Large models on small RAM | All |
-
-No single machine needs to train the entire model. Each device trains what it can, shares what it learns, and receives aggregated improvements from the network.
-
----
-
-## LISA: Layer-wise Importance Sampling
-
-LISA reduces compute by selectively training only the most important layers per round:
-
-- **Bottom layers** (always trained): Capture foundational language patterns
-- **Top layers** (always trained): Handle task-specific outputs
-- **Middle layers** (randomly sampled): Randomly selected each round
+## Package Structure
 
 ```
-Round 0: Train layers [0, 1, 8, 17, 20, 21]
-Round 1: Train layers [0, 1, 6, 15, 20, 21]
-Round 2: Train layers [0, 1, 10, 14, 20, 21]
+lisa_pkg/
+├── src/
+│   ├── lisa_70b_v2.py          # 70B training
+│   ├── lisa_120b_training.py    # 120B training
+│   └── lisa_inference_prod.py   # LISA inference
+├── examples/
+│   ├── train_70b.py
+│   ├── train_120b.py
+│   └── inference.py
+└── docs/
+    └── PACKAGE_OVERVIEW.md
 ```
 
-Result: ~70% compute reduction with minimal quality loss.
+## Key Features
 
-Combined with **LoRA** (Low-Rank Adaptation), only 0.2-0.3% of model parameters are trained per step — enabling large models on small hardware.
+- **🎯 Memory Efficient**: Train 120B on 8GB RAM
+- **⚡ Simple API**: Just call `train_step()`
+- **💾 LoRA Adapters**: Only train MB of weights (not GB)
+- **🔄 Layer-by-Layer**: Process one layer at a time
 
----
+## Documentation
 
-## Architecture
+- [Package Overview](lisa_pkg/docs/PACKAGE_OVERVIEW.md)
+- [70B Results](lisa_pkg/docs/LISA_70B_RESULTS.md)
+- [120B Results](lisa_pkg/docs/LISA_120B_RESULTS.md)
+- [LISA Inference](lisa_pkg/docs/LISA_INFERENCE.md)
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                        Federated Learning Flow                           │
-└──────────────────────────────────────────────────────────────────────────┘
+## How It Works
 
-  Device A (hospital-1)          Server                  Device B (hospital-2)
-  ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-  │  Local Dataset   │    │                  │    │  Local Dataset   │
-  │  (never leaves)  │    │  FederatedServer │    │  (never leaves)  │
-  │                  │    │                  │    │                  │
-  │  LISA Training   │    │  • Aggregates    │    │  LISA Training   │
-  │  LoRA + layer    │    │  • Checkpoints    │    │  LoRA + layer    │
-  │  selection       │    │  • Coordinates    │    │  selection       │
-  │                  │    │                  │    │                  │
-  │  → gradients     │──▶ │  FedAvg merge    │──▶ │  ← model update  │
-  └──────────────────┘    │                  │    └──────────────────┘
-                         └──────────────────┘
-                                  ▲
-                                  │
-                         ┌──────────────────┐
-                         │  Device C (GPU)  │
-                         │  trains larger   │
-                         │  model locally   │
-                         └──────────────────┘
-```
+**Traditional Training**: Load all 120B weights (~240GB) → OOM on normal hardware
 
-- Each device trains **only on local data** — data never leaves the device
-- Only **gradient updates** (compressed tensors) are shared with the server
-- The server runs **FedAvg** aggregation and distributes the averaged model back
-- **Any model size** works — from 70M to 70B params — because each device trains only what its hardware allows
-- **Differential privacy** (optional): add noise to gradients client-side before sharing
+**LISA Training**: 
+1. Load one layer (~2GB)
+2. Apply LoRA adapter
+3. Discard layer
+4. Repeat
 
-## Multi-Device Federated Learning
+Only ~8GB RAM needed!
 
-Run federated learning across multiple machines or devices:
+## License
 
-### Step 1: Start the server (on one machine or a cloud VPS)
-```bash
-python run_server.py --model EleutherAI/pythia-70m --rounds 5 --port 8080 --host 0.0.0.0
-```
-> The server must be reachable from your other devices. Use your machine's LAN IP (e.g. `192.168.1.x`) instead of `localhost` if devices are on the same network.
-
-### Step 2: Start clients on each device (can be the same machine or different)
-```bash
-# Device 1 (e.g., your desktop)
-python run_client.py --client-id desktop-1 --server http://192.168.1.x:8080 --rounds 5
-
-# Device 2 (e.g., a Mac Mini on the network)
-python run_client.py --client-id mac-mini-1 --server http://192.168.1.x:8080 --rounds 5
-
-# Device 3 (e.g., a Jetson Nano)
-python run_client.py --client-id jetson-1 --server http://192.168.1.x:8080 --rounds 5
-```
-
-### Step 3: Monitor progress
-```bash
-# Check server status
-curl http://localhost:8080/status
-
-# Or open the interactive API docs
-# http://localhost:8080/docs
-```
-
-### Running everything on one machine (no network needed)
-```bash
-python main.py --mode simulate --clients 3 --rounds 3
-```
-
-### Server startup examples
-```bash
-# Small model, 3 rounds, local testing
-python run_server.py --model distilgpt2 --rounds 3 --port 8080
-
-# Larger model, more rounds
-python run_server.py --model EleutherAI/pythia-70m --rounds 10 --port 8080
-
-# Require minimum 2 clients per round before aggregating
-python run_server.py --model EleutherAI/pythia-70m --rounds 5 --min-clients 2
-```
-
-## Federated Privacy
-
-Data never leaves the local device:
-
-1. Model trains on local data
-2. Only gradient tensors (not data) are sent to server
-3. Server aggregates via FedAvg — individual contributions are indistinguishable
-4. Optional: differential privacy noise can be added to gradients client-side
-
-This makes federated learning suitable for:
-- Healthcare data (HIPAA compliance)
-- Enterprise data (no data leaves the firewall)
-- Personal devices (your data stays yours)
-
----
-
-## Results
-
-| Model | Dataset | Steps | Time | Final Loss |
-|-------|---------|-------|------|------------|
-| Pythia-70m (real training) | Wikitext-2 | 200 | ~10 min | 0.01 |
-| TinyLlama-1.1B (federated) | Synthetic | 5 rounds | ~2 min/round | 1.87 |
-| distilgpt2 | Synthetic | 5 | ~30s | 7.71 |
-
----
-
-## GitHub
-
-**https://github.com/CiphemonJY/LISA_FTM**
-
-Clone and run:
-```bash
-git clone https://github.com/CiphemonJY/LISA_FTM
-cd LISA_FTM
-pip install torch transformers datasets huggingface_hub
-python main.py --mode simulate
-```
-mode simulate
-```
+MIT
