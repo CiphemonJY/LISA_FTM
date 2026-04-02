@@ -6,7 +6,7 @@ Training large language models on limited RAM using LISA, MoE, and LoRA techniqu
 
 ```bash
 # Connect to Jetson
-ssh jetson@10.0.0.145
+ssh jetson@YOUR_JETSON_IP
 
 # Run the training script
 python3 /tmp/lisa_moe_improve/train_final.py

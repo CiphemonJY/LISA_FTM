@@ -68,7 +68,7 @@ cd LISA_FTM
 
 ```bash
 # Set environment variables
-export JETSON_IP="10.0.0.145"  # Your Jetson's IP
+export JETSON_IP="YOUR_JETSON_IP"  # Your Jetson's IP
 export JETSON_USER="jetson"      # Your Jetson username
 
 # Run training

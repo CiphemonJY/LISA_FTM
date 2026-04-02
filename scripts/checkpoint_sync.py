@@ -7,7 +7,7 @@ import os, sys, time, subprocess, hashlib
 from datetime import datetime
 
 # Config - Use environment variables for sensitive info
-JETSON_IP = os.environ.get("JETSON_IP", "10.0.0.145")  # Set JETSON_IP env var
+JETSON_IP = os.environ.get("JETSON_IP", "YOUR_JETSON_IP")  # Set JETSON_IP env var
 JETSON_USER = os.environ.get("JETSON_USER", "jetson")  # Set JETSON_USER env var
 MAC_CHECKPOINT_DIR = "/tmp/lisa_standalone_checkpoints"
 JETSON_CHECKPOINT_DIR = "/tmp/lisa_jetson_checkpoints"

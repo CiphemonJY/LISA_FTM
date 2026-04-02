@@ -44,7 +44,7 @@ def join_and_train(code, server_url, client_id, steps=10):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--join", "-j")
-    parser.add_argument("--server", "-s", default="http://10.0.0.43:8080")
+    parser.add_argument("--server", "-s", default="http://YOUR_SERVER_IP:8080")
     parser.add_argument("--client-id", default=None)
     parser.add_argument("--steps", type=int, default=10)
     args = parser.parse_args()

@@ -15,7 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from peft import LoraConfig, get_peft_model
 
 # ============ Config ============
-SERVER_URL = "http://10.0.0.43:8080"
+SERVER_URL = "http://YOUR_SERVER_IP:8080"
 MODEL_NAME = "Qwen/Qwen2.5-0.5B"
 CLIENT_ID = f"client_{os.urandom(4).hex()}"
 LOG_FILE = "/tmp/lisa_robust_client.log"

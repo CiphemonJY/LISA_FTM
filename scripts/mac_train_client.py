@@ -9,7 +9,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from peft import LoraConfig, get_peft_model
 
-SERVER_URL = "http://10.0.0.43:8080"
+SERVER_URL = "http://YOUR_SERVER_IP:8080"
 MODEL_NAME = "Qwen/Qwen2.5-0.5B"
 LOG_FILE = "/tmp/lisa_mac_train.log"
 CHECKPOINT_DIR = "checkpoints"

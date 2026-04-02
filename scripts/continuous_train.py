@@ -13,8 +13,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-SERVER_URL = "http://10.0.0.43:8080"
-JETSON_HOST = os.environ.get("JETSON_HOST", "jetson@10.0.0.145")
+SERVER_URL = "http://YOUR_SERVER_IP:8080"
+JETSON_HOST = os.environ.get("JETSON_HOST", "jetson@YOUR_JETSON_IP")
 CHECKPOINT_DIR = "checkpoints"
 EVAL_RESULTS_FILE = "/tmp/lisa_eval_results.json"
 LOG_FILE = "/tmp/lisa_continuous.log"

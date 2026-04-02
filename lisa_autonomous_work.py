@@ -14,7 +14,7 @@ from pathlib import Path
 
 # Paths
 WORKSPACE = Path.home() / '.openclaw' / 'workspace' / 'LISA_FTM'
-JETSON_HOST = 'jetson@10.0.0.145'
+JETSON_HOST = 'jetson@YOUR_JETSON_IP'
 LOG_DIR = WORKSPACE / 'logs' / 'autonomous'
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
