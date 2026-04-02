@@ -1,92 +1,67 @@
-# LISA - Train 32B-120B Models on Limited RAM
+# LISA 120B Scale - Jetson Implementation
 
-[![GitHub release](https://img.shields.io/github/v/release/CiphemonJY/LISA_FTM)](https://github.com/CiphemonJY/LISA_FTM/releases)
-[![Python](https://img.shields.io/badge/python-3.8+-blue)](https://www.python.org/)
-
-> **🚀 BREAKTHROUGH (2026-03-30): Train 120B models on Jetson Orin (7.4GB RAM)!**
-
-LISA (Layer-Indexed Sequential Adapters) enables training massive language models on consumer hardware.
-
-## Hardware Results
-
-| Model | Traditional RAM | LISA RAM | Savings |
-|-------|----------------|----------|---------|
-| 32B | 64GB | **4GB** | 94% |
-| 70B | 140GB | **6GB** | 96% |
-| **120B** | **240GB** | **7.89GB** | **97%** |
-
-Tested on: **Jetson Orin (7.4GB RAM)**
+Training large language models on limited RAM using LISA, MoE, and LoRA techniques.
 
 ## Quick Start
 
 ```bash
-# Clone
-git clone https://github.com/CiphemonJY/LISA_FTM.git
-cd LISA_FTM
+# Connect to Jetson
+ssh jetson@10.0.0.145
 
-# Train 70B model
-python lisa_pkg/src/lisa_70b_v2.py
-
-# Train 120B model
-python lisa_pkg/src/lisa_120b_training.py
-
-# Run LISA inference
-python lisa_pkg/src/lisa_inference_prod.py
+# Run the training script
+python3 /tmp/lisa_moe_improve/train_final.py
 ```
 
-## Python API
+## Architecture
 
-```python
-from lisa_pkg.src.lisa_70b_v2 import LISATrainer, CONFIG
+### LISA (Layer-wise Importance Sampling)
+- Train only 2 of N layers simultaneously
+- Reduces memory by ~N/2×
+- Implemented in `LISA` class
 
-trainer = LISATrainer(CONFIG)
-for text in dataset:
-    result = trainer.train_step(text)
-    # loss=1.15, mem=6GB
+### MoE (Mixture of Experts)
+- 8 experts with top-2 routing
+- Only activates subset per token
+- Memory efficient for large models
+
+### LoRA (Low-Rank Adaptation)
+- rank=2-4, alpha=4-8
+- Only trains adapter weights
+- Base model stays frozen
+
+## Results
+
+| Metric | Value |
+|--------|-------|
+| Cross-Entropy Loss | 4.49 → 3.98 (-11%) |
+| Perplexity | 89.0 → 53.6 (-40%) |
+| Adapter Size | 0.64MB |
+| Memory Usage | ~1.6GB |
+
+## Files
+
+```
+jetson_scripts/
+├── train_final.py     # Production training with CE loss
+├── lisa_v7.py         # Latest implementation
+└── ...
+
+jetson_weights/
+# Real extracted weights from Qwen2.5-14B GGUF
 ```
 
-## Package Structure
+## Hardware
 
-```
-lisa_pkg/
-├── src/
-│   ├── lisa_70b_v2.py          # 70B training
-│   ├── lisa_120b_training.py    # 120B training
-│   └── lisa_inference_prod.py   # LISA inference
-├── examples/
-│   ├── train_70b.py
-│   ├── train_120b.py
-│   └── inference.py
-└── docs/
-    └── PACKAGE_OVERVIEW.md
-```
+- **Jetson Orin**: 7.4GB RAM, 8GB GPU
+- **GPU Status**: Broken (needs reboot)
+- **NVMe**: 200GB available
 
-## Key Features
+## Limitations
 
-- **🎯 Memory Efficient**: Train 120B on 8GB RAM
-- **⚡ Simple API**: Just call `train_step()`
-- **💾 LoRA Adapters**: Only train MB of weights (not GB)
-- **🔄 Layer-by-Layer**: Process one layer at a time
+- True 120B training requires multi-GPU
+- Single 7.4GB cannot hold full 120B fp16
+- Need actual MoE GGUF file for 120B-scale
 
-## Documentation
+## Research Notes
 
-- [Package Overview](lisa_pkg/docs/PACKAGE_OVERVIEW.md)
-- [70B Results](lisa_pkg/docs/LISA_70B_RESULTS.md)
-- [120B Results](lisa_pkg/docs/LISA_120B_RESULTS.md)
-- [LISA Inference](lisa_pkg/docs/LISA_INFERENCE.md)
-
-## How It Works
-
-**Traditional Training**: Load all 120B weights (~240GB) → OOM on normal hardware
-
-**LISA Training**: 
-1. Load one layer (~2GB)
-2. Apply LoRA adapter
-3. Discard layer
-4. Repeat
-
-Only ~8GB RAM needed!
-
-## License
-
-MIT
+See `PROGRESS_REPORT_2026-04-01.md` for full details.
